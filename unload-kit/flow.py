@@ -13,10 +13,13 @@ Pasos:
   1. Sincroniza el JSON con la tabla destino (muestra el diff, respalda el viejo)
   2. Lo publica en S3 si cambio y espera a que MWAA lo tome; verifica que el
      generador desplegado soporte el modo estricto (tag SCHEMA-STRICT)
-  3. Dispara el DAG de UNLOAD con el rango (conf load_start / load_end)
-  4. Espera; si falla, corta sin mover nada
-  5. Mueve SOLO las particiones que escribio esta corrida (ignora restos
-     viejos del landing), registra particiones
+  3. Revisa el landing: las particiones del rango que ya estan y son validas
+     (run OK, posteriores al JSON, parquet con el esquema del destino) NO se
+     vuelven a bajar de Redshift
+  4. Dispara el DAG de UNLOAD solo para lo que falta (conf load_start / load_end)
+     y espera; si falla, corta sin mover nada
+  5. Mueve particion por particion (bajar, reemplazar, subir, verificar, liberar
+     disco) y registra. Si se corta, re-correr el mismo comando sigue donde quedo
   6. Verifica y limpia
 
 Tabla nueva (schema.tabla sin JSON): antes genera el JSON desde Redshift.
@@ -29,6 +32,8 @@ Uso:
     flow 7 --run manual__2026-09-16T19:12:17Z retoma un run ya disparado
     flow 7 --solo-mover [--desde ... --hasta ...]
     flow 7 ... --no-sync                      no toca el JSON (solo valida)
+    flow 7 ... --forzar-unload                baja todo el rango de Redshift aunque
+                                              ya este en el landing
     flow 7 ... --auto                         sin confirmaciones (salvo borrados)
     flow 7 ... --auto-borrar                  sin confirmaciones, incluidos borrados
     flow schema.tabla --conn <conn_id> --column-dt <col>
@@ -39,7 +44,7 @@ Requiere unload.py en el mismo directorio, boto3 + requests (como mwaa_cert)
 y psycopg2 solo si genera o valida contra Redshift (FLOW_RS_PASS).
 """
 
-__version__ = "2.2"
+__version__ = "2.3"
 
 import json
 import os
@@ -130,15 +135,29 @@ class Pasos:
         print(f"{C.B}━━ [{self.i}/{len(self.plan)}] {label} {C.END}")
         print("─" * 60)
 
+    def saltar(self, label, motivo=""):
+        self.i += 1
+        print()
+        print(f"{C.DIM}━━ [{self.i}/{len(self.plan)}] {label}: no hace falta"
+              + (f" ({motivo})" if motivo else "") + f"{C.END}")
+
 
 def parse_iso(s):
     if not s:
         return None
     try:
         d = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
-        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
     except ValueError:
-        return None
+        try:
+            from email.utils import parsedate_to_datetime
+            d = parsedate_to_datetime(str(s))   # formato de la CLI v1
+        except (TypeError, ValueError):
+            return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def fmt_utc(d):
+    return f"{d.astimezone(timezone.utc):%Y-%m-%d %H:%M}" if d else "?"
 
 
 # ─── MWAA ─────────────────────────────────────────────────────────────────────
@@ -726,38 +745,340 @@ def paso_sync(cfg, glue_tbl, fuente):
     return True
 
 
-# ─── landing ──────────────────────────────────────────────────────────────────
+# ─── landing: que se puede reutilizar ─────────────────────────────────────────
+#
+# Una particion que ya esta en el landing se mueve SIN volver a correr el
+# UNLOAD solo si se puede confiar en ella:
+#   1. es posterior al JSON vigente (schema_synced_at): si el JSON cambio
+#      despues, esa particion salio con otro SELECT;
+#   2. la escribio un run del DAG que termino OK: un run fallido puede dejar
+#      archivos a medias;
+#   3. su parquet tiene exactamente las columnas y los tipos de la tabla
+#      destino. Se lee solo el footer de un archivo por particion (unos KB).
+# Lo que no pasa las tres se vuelve a bajar de Redshift.
 
-def particiones_de_la_corrida(cfg, desde_utc, margen_min=5):
-    """Particiones del landing escritas por esta corrida (LastModified >= inicio).
+# Desfase tolerado entre el reloj de S3 (LastModified) y el de MWAA.
+MARGEN_RELOJ = timedelta(seconds=60)
 
-    Asi el movimiento ignora restos de corridas anteriores que sigan en el
-    landing (CLEANPATH con PARTITION BY solo limpia las carpetas que reescribe).
+
+class _Thrift:
+    """Lector minimo del protocolo compacto de Thrift (footer de parquet)."""
+
+    def __init__(self, b):
+        self.b, self.i = b, 0
+
+    def _byte(self):
+        v = self.b[self.i]
+        self.i += 1
+        return v
+
+    def _varint(self):
+        r = sh = 0
+        while True:
+            x = self._byte()
+            r |= (x & 0x7F) << sh
+            if not x & 0x80:
+                return r
+            sh += 7
+
+    def _zz(self):
+        n = self._varint()
+        return (n >> 1) ^ -(n & 1)
+
+    def _valor(self, t):
+        if t in (1, 2):                     # bool: en un struct viaja en el header
+            return t == 1
+        if t == 3:                          # i8
+            v = self._byte()
+            return v - 256 if v > 127 else v
+        if t in (4, 5, 6):                  # i16 / i32 / i64
+            return self._zz()
+        if t == 7:                          # double (no hace falta el valor)
+            self.i += 8
+            return None
+        if t == 8:                          # binary / string
+            n = self._varint()
+            v = self.b[self.i:self.i + n]
+            self.i += n
+            return v
+        if t in (9, 10):                    # list / set
+            h = self._byte()
+            n, et = h >> 4, h & 0x0F
+            if n == 15:
+                n = self._varint()
+            return [self._elem(et) for _ in range(n)]
+        if t == 11:                         # map
+            n = self._varint()
+            if not n:
+                return []
+            kv = self._byte()
+            return [(self._elem(kv >> 4), self._elem(kv & 0x0F)) for _ in range(n)]
+        if t == 12:
+            return self.struct()
+        raise ValueError(f"tipo thrift desconocido: {t}")
+
+    def _elem(self, t):
+        if t in (1, 2):                     # bool dentro de una coleccion: 1 byte
+            return self._byte() == 1
+        return self._valor(t)
+
+    def struct(self):
+        out, fid = {}, 0
+        while True:
+            h = self._byte()
+            if h == 0:
+                return out
+            d, t = h >> 4, h & 0x0F
+            fid = fid + d if d else self._zz()
+            out[fid] = self._valor(t)
+
+
+# SchemaElement: 1 type, 4 name, 5 num_children, 6 converted_type,
+# 7 scale, 8 precision, 10 logicalType
+PQ_FISICO = {0: "boolean", 1: "int", 2: "bigint", 3: "timestamp", 4: "float",
+             5: "double", 6: "binary", 7: "binary"}
+PQ_CONVERTIDO = {0: "string", 4: "string", 19: "string", 6: "date", 7: "time",
+                 8: "time", 9: "timestamp", 10: "timestamp", 11: "tinyint",
+                 12: "smallint", 13: "int", 14: "bigint", 15: "tinyint",
+                 16: "smallint", 17: "int", 18: "bigint"}
+PQ_LOGICO = {1: "string", 4: "string", 12: "string", 6: "date", 7: "time",
+             8: "timestamp"}
+
+
+def familia_parquet(el):
+    lt = el.get(10) or {}
+    if 5 in lt:
+        return f"decimal({lt[5].get(2)},{lt[5].get(1, 0)})"
+    if el.get(6) == 5:
+        return f"decimal({el.get(8)},{el.get(7) or 0})"
+    for k, fam in PQ_LOGICO.items():
+        if k in lt:
+            return fam
+    if 10 in lt:
+        return {8: "tinyint", 16: "smallint", 32: "int", 64: "bigint"}.get(
+            lt[10].get(1), "int")
+    if el.get(6) in PQ_CONVERTIDO:
+        return PQ_CONVERTIDO[el[6]]
+    return PQ_FISICO.get(el.get(1), "?")
+
+
+def columnas_parquet(footer):
+    """[(columna, familia)] del footer (FileMetaData) de un parquet."""
+    els = _Thrift(footer).struct().get(2) or []
+    if not els:
+        raise ValueError("el footer no trae esquema")
+
+    def saltar(i):
+        n = els[i].get(5) or 0
+        i += 1
+        for _ in range(n):
+            i = saltar(i)
+        return i
+
+    cols, i = [], 1                         # els[0] es la raiz
+    while i < len(els):
+        el = els[i]
+        nombre = el.get(4, b"").decode("utf-8", "replace")
+        if el.get(5):                       # grupo anidado: Redshift no los escribe
+            cols.append((nombre, "anidada"))
+            i = saltar(i)
+        else:
+            cols.append((nombre, familia_parquet(el)))
+            i += 1
+    return cols
+
+
+def leer_esquema_parquet(s3, bucket, key, size):
+    """Lee SOLO el final del archivo (rango de bytes) y devuelve sus columnas."""
+    def cola(desde):
+        return s3.get_object(Bucket=bucket, Key=key,
+                             Range=f"bytes={desde}-{size - 1}")["Body"].read()
+    b = cola(max(0, size - 65536))
+    if len(b) < 12 or b[-4:] != b"PAR1":
+        raise ValueError("no es un parquet")
+    n = int.from_bytes(b[-8:-4], "little")
+    if n + 8 > size:
+        raise ValueError("footer invalido")
+    if n + 8 > len(b):
+        b = cola(size - n - 8)
+    return columnas_parquet(b[-8 - n:-8])
+
+
+def familia_glue(t):
+    t = (t or "").strip().lower().replace(" ", "")
+    if t == "string" or t.startswith(("varchar", "char")):
+        return "string"
+    if t == "integer":
+        return "int"
+    if t == "decimal":
+        return "decimal(10,0)"
+    return t
+
+
+ENTEROS_32 = {"int", "smallint", "tinyint"}   # en parquet los tres son INT32
+
+
+def tipos_compatibles(destino, parquet):
+    if destino == parquet:
+        return True
+    if destino == "string":
+        return parquet in ("string", "binary")
+    return destino in ENTEROS_32 and parquet in ENTEROS_32
+
+
+def comparar_esquema(pq_cols, glue_cols):
+    """None si el parquet se lee tal cual en la tabla destino; si no, el motivo."""
+    pq = {n.lower(): f for n, f in pq_cols}
+    dest = [(c["Name"].lower(), familia_glue(c.get("Type"))) for c in glue_cols]
+    faltan = [n for n, _ in dest if n not in pq]
+    malos = [(n, t, pq[n]) for n, t in dest if n in pq and not tipos_compatibles(t, pq[n])]
+    sobran = [n for n in pq if n not in dict(dest)]
+    if faltan:
+        return f"le faltan {len(faltan)} columnas del destino (ej. {', '.join(faltan[:3])})"
+    if malos:
+        n, t, f = malos[0]
+        return f"{len(malos)} columnas con otro tipo (ej. {n}: parquet {f}, destino {t})"
+    if sobran:
+        return f"trae {len(sobran)} columnas que el destino no tiene (ej. {', '.join(sobran[:3])})"
+    return None
+
+
+def _esquemas_que_no_calzan(cfg, glue_tbl, enc):
+    """{fecha: (motivo, detalle)} de las particiones cuyo parquet no calza."""
+    try:
+        import boto3
+        s3 = boto3.session.Session(profile_name=U.PROFILE_SRC,
+                                   region_name=MWAA_REGION).client("s3")
+    except Exception as e:  # noqa: BLE001
+        return {f: ("no pude revisar el parquet", str(e)[:160]) for f in enc}
+    from concurrent.futures import ThreadPoolExecutor
+    col = cfg.get("column_dt", "calendar_dt")
+    p_src = U.PREFIX_SRC_TPL.format(schema=cfg["schema"], table=cfg["table"])
+    glue_cols = glue_tbl["StorageDescriptor"].get("Columns", [])
+
+    def una(f):
+        arch = {n: t for n, t in enc[f]["archivos"].items() if t > 0}
+        cand = sorted(n for n in arch if n.endswith(".parquet")) or sorted(arch)
+        if not cand:
+            return f, ("particion sin archivos", "")
+        try:
+            cols = leer_esquema_parquet(s3, U.BUCKET_SRC, f"{p_src}{col}={f}/{cand[0]}",
+                                        arch[cand[0]])
+        except Exception as e:  # noqa: BLE001
+            return f, ("no pude leer el parquet", f"{cand[0]}: {str(e)[:140]}")
+        m = comparar_esquema(cols, glue_cols)
+        return f, (("esquema distinto al destino", m) if m else None)
+
+    print(f"  Leyendo el esquema del parquet de {len(enc)} particiones...", end=" ", flush=True)
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        res = dict(ex.map(una, sorted(enc)))
+    print("listo")
+    return {f: m for f, m in res.items() if m}
+
+
+def runs_del_dag(s, host, dag_id, desde):
+    """[(inicio, fin, estado, run_id)] de los runs que empezaron despues de 'desde'."""
+    q = (f"dags/{dag_id}/dagRuns?limit=100"
+         f"&start_date_gte={desde.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%S}Z")
+    d = api(s, host, "GET", q, silencioso=True)
+    if not isinstance(d, dict):
+        return None
+    return [(parse_iso(r.get("start_date")), parse_iso(r.get("end_date")),
+             (r.get("state") or "?").lower(), r.get("dag_run_id"))
+            for r in d.get("dag_runs", [])]
+
+
+def revisar_landing(cfg, glue_tbl, fechas=None, s=None, host=None, dag_id=None):
+    """Clasifica las particiones del landing. Devuelve (sirven, descartes, faltan).
+
+    fechas: las pedidas (None = todo lo que haya en el landing).
+    sirven: se pueden mover tal cual.  descartes: {fecha: (motivo, detalle)}.
+    faltan: pedidas que no estan en el landing.
     """
     col = cfg.get("column_dt", "calendar_dt")
     p_src = U.PREFIX_SRC_TPL.format(schema=cfg["schema"], table=cfg["table"])
+    tam = U.particiones_s3(U.BUCKET_SRC, p_src, U.PROFILE_SRC)
+    enc = {p.split("=", 1)[1]: v for p, v in tam.items() if p.startswith(col + "=")}
+    faltan = []
+    if fechas is not None:
+        pedidas = set(fechas)
+        enc = {f: v for f, v in enc.items() if f in pedidas}
+        faltan = sorted(pedidas - set(enc))
+    if not enc:
+        print("  El landing no tiene particiones" + (" de esas fechas." if fechas else "."))
+        return [], {}, faltan
+
+    nunca = datetime.min.replace(tzinfo=timezone.utc)   # fecha ilegible: se trata como vieja
+    lm = {f: (parse_iso(v["lm_min"]) or nunca, parse_iso(v["lm_max"]) or nunca)
+          for f, v in enc.items()}
+    t_min = min(a for a, _ in lm.values())
+    print(f"  En el landing : {len(enc)} particiones, "
+          f"{U.human(sum(v['bytes'] for v in enc.values()))}, escritas "
+          f"{fmt_utc(t_min)} .. {fmt_utc(max(z for _, z in lm.values()))} UTC")
+
+    descartes = {}
+    vigente = parse_iso(cfg.get("schema_synced_at"))
+    if vigente:
+        for f, (a, _) in lm.items():
+            if a < vigente:
+                descartes[f] = ("anteriores al JSON vigente",
+                                f"el JSON se sincronizo {fmt_utc(vigente)} UTC")
+
+    if s is None:
+        U.warn("Sin conexion con MWAA: no puedo confirmar que run las escribio;")
+        U.info("se valida solo la fecha del JSON y el esquema del parquet.")
+    else:
+        runs = runs_del_dag(s, host, dag_id, t_min - timedelta(days=2))
+        if runs is None:
+            U.warn("No pude leer los runs del DAG en MWAA.")
+        for f, (a, z) in lm.items():
+            if f in descartes:
+                continue
+            if runs is None:
+                descartes[f] = ("no pude confirmar el run que las escribio", "")
+                continue
+            # quien la escribio: el ULTIMO run que empezo antes de su primer
+            # archivo (los runs no se solapan: max_active_runs=1). Con un margen
+            # amplio, un tramo que falla justo despues de otro exitoso quedaria
+            # atribuido al exitoso.
+            previos = [r for r in runs if r[0] and r[0] - MARGEN_RELOJ <= a]
+            run = max(previos, key=lambda r: r[0]) if previos else None
+            if run is None or (run[1] is not None and z > run[1] + MARGEN_RELOJ):
+                descartes[f] = ("no las escribio ningun run del DAG", "")
+            elif run[2] != "success":
+                descartes[f] = ("escritas por un run que no termino OK", f"{run[3]}: {run[2]}")
+
+    pendientes = {f: enc[f] for f in enc if f not in descartes}
+    if pendientes and glue_tbl is None:
+        U.warn("La tabla destino no esta en el Catalog: no se valida el esquema del parquet.")
+    elif pendientes:
+        descartes.update(_esquemas_que_no_calzan(cfg, glue_tbl, pendientes))
+
+    sirven = sorted(f for f in enc if f not in descartes)
+    print(f"  {C.OK}✓{C.END} {len(sirven)} se pueden mover tal cual"
+          + (f": {U.rangos(sirven, 3)}" if sirven else ""))
+    if descartes:
+        U.warn(f"{len(descartes)} no se reutilizan:")
+        por_motivo = {}
+        for f, (m, det) in sorted(descartes.items()):
+            por_motivo.setdefault(m, ([], det))[0].append(f)
+        for m, (fs, det) in por_motivo.items():
+            U.info(f"{m}: {U.rangos(fs, 3)}")
+            if det:
+                U.info(f"  ej. {det}")
+    if faltan:
+        print(f"  · {len(faltan)} fechas no estan en el landing: {U.rangos(faltan, 3)}")
+    return sirven, descartes, faltan
+
+
+def particiones_de_la_corrida(cfg, desde_utc, margen_min=5):
+    """Fechas del landing escritas desde desde_utc (una corrida del DAG)."""
+    col = cfg.get("column_dt", "calendar_dt")
+    p_src = U.PREFIX_SRC_TPL.format(schema=cfg["schema"], table=cfg["table"])
     corte = desde_utc - timedelta(minutes=margen_min)
-    parts, token = set(), None
-    while True:
-        args = ["s3api", "list-objects-v2", "--bucket", U.BUCKET_SRC,
-                "--prefix", p_src, "--max-items", "1000"]
-        if token:
-            args += ["--starting-token", token]
-        out = U.aws(args, U.PROFILE_SRC, check=False)
-        if out is None:
-            raise RuntimeError("No pude listar el landing (sesion SSO de origen vencida?)")
-        if not isinstance(out, dict):
-            break
-        for o in out.get("Contents", []) or []:
-            lm = parse_iso(o.get("LastModified"))
-            if lm and lm >= corte:
-                seg = o["Key"][len(p_src):].split("/", 1)[0]
-                if seg.startswith(col + "="):
-                    parts.add(seg.split("=", 1)[1])
-        token = out.get("NextToken")
-        if not token:
-            break
-    return sorted(parts)
+    tam = U.particiones_s3(U.BUCKET_SRC, p_src, U.PROFILE_SRC)
+    return sorted(p.split("=", 1)[1] for p, v in tam.items()
+                  if p.startswith(col + "=") and parse_iso(v["lm_max"]) >= corte)
 
 
 def rango_a_parts(desde, hasta):
@@ -772,11 +1093,54 @@ def rango_a_parts(desde, hasta):
 
 # ─── pipeline ─────────────────────────────────────────────────────────────────
 
+def esperar_unload(cfg, s, host, dag_id, run_id, t0, sel):
+    """Espera un run. Devuelve el dagRun (dict) si termino OK, si no None."""
+    if t0 is None and not api(s, host, "GET", f"dags/{dag_id}/dagRuns/{run_id}"):
+        U.bad(f"No encontre el run '{run_id}'.")
+        return None
+    U.info("Ctrl-C corta la espera; el DAG sigue corriendo en MWAA.")
+    try:
+        state = wait_run(s, host, dag_id, run_id)
+    except MwaaNoDisponible as e:
+        U.bad(str(e))
+        U.info(f"El DAG sigue corriendo en MWAA (run {run_id}).")
+        U.info(f"Cuando vuelva la VPN:  flow {sel} --run {run_id}")
+        return None
+    if state != "success":
+        U.bad(f"El DAG termino en {state.upper()}. No se mueve nada.")
+        show_failed_tasks(s, host, dag_id, run_id)
+        return None
+    U.ok("UNLOAD completado.")
+    r = api(s, host, "GET", f"dags/{dag_id}/dagRuns/{run_id}", silencioso=True) or {}
+    t_ini = parse_iso(r.get("start_date")) or t0
+    if t_ini:
+        conf = r.get("conf") or {}
+        parts = [p for p in particiones_de_la_corrida(cfg, t_ini)
+                 if conf.get("load_start", "") <= p <= conf.get("load_end", "9999")]
+        if parts:
+            print(f"  Esta corrida escribio {len(parts)} particiones: {U.rangos(parts, 3)}")
+        else:
+            U.warn("Esta corrida no escribio particiones: el origen no tiene datos para ese rango.")
+    return r
+
+
+def tramos_a_bajar(fechas):
+    """Rangos de UNLOAD que cubren 'fechas': uno por tramo continuo (hasta 3),
+    o uno solo de punta a punta si estan muy salteadas."""
+    bs = U.bloques(fechas)
+    if len(bs) <= 3:
+        return [(a, b) for a, b, _ in bs]
+    return [(min(fechas), max(fechas))]
+
+
 def run_flow(cfg, o):
     schema, table = cfg["schema"], cfg["table"]
     dag_id = DAG_ID_TPL.format(schema=schema, table=table)
     sel = cfg.get("_sel", table)
     publica = o["solo_sync"] or o["solo_json"]
+    # Lo que ya esta en el landing (y es valido) no se vuelve a bajar de Redshift.
+    reusa = not (o["solo_dag"] or o["forzar_unload"] or o["run_id"]
+                 or o["solo_mover"] or publica)
 
     plan = []
     if o["prep"]:
@@ -784,6 +1148,8 @@ def run_flow(cfg, o):
     if not o["solo_mover"] and not o["run_id"]:
         plan += ["sync", "publicar"]
     if not (o["solo_mover"] or publica):
+        if reusa:
+            plan.append("landing")
         if not o["run_id"]:
             plan.append("disparar")
         plan.append("esperar")
@@ -794,7 +1160,7 @@ def run_flow(cfg, o):
     print()
     print(f"{C.B}Pipeline: {schema}.{table}{C.END}")
     print(f"  DAG    : {dag_id}")
-    if o["desde"] and "disparar" in plan:
+    if o["desde"] and ("disparar" in plan or o["solo_mover"]):
         print(f"  Rango  : {o['desde']}  ->  {o['hasta']}")
     if o["run_id"]:
         print(f"  Run    : {o['run_id']}")
@@ -812,6 +1178,7 @@ def run_flow(cfg, o):
         U.info("En el listado, los de backfill aparecen como [only_unload].")
         return False
 
+    rango = rango_a_parts(o["desde"], o["hasta"]) if o["desde"] and o["hasta"] else None
     okey = False
     with U.KeepAwake():
         s = host = None
@@ -819,6 +1186,14 @@ def run_flow(cfg, o):
             print("\n  Conectando con MWAA...", end=" ", flush=True)
             s, host = mwaa_session(timeout=10)
             print("OK")
+        elif "mover" in plan:
+            # --solo-mover: MWAA es opcional (confirma que run escribio el landing)
+            print("\n  Conectando con MWAA...", end=" ", flush=True)
+            try:
+                s, host = mwaa_session(timeout=8)
+                print("OK")
+            except MwaaNoDisponible:
+                print("sin conexion (VPN?)")
 
         # ── generar JSON (tabla nueva) ──
         fuente = None
@@ -842,13 +1217,15 @@ def run_flow(cfg, o):
             cfg.update(json.loads(path.read_text()))
             cfg["_file"] = path
 
+        g = U.aws(["glue", "get-table", "--database-name", U.GLUE_DB,
+                   "--name", cfg["_glue_table"]], U.PROFILE_DST, check=False)
+        glue_tbl = g["Table"] if g else None
+
         # ── sincronizar con el destino y publicar ──
         if "sync" in plan:
             paso("Sincronizando el JSON con la tabla destino" if not o["no_sync"]
                  else "Validando el JSON contra la tabla destino")
-            g = U.aws(["glue", "get-table", "--database-name", U.GLUE_DB,
-                       "--name", cfg["_glue_table"]], U.PROFILE_DST, check=False)
-            if g is None:
+            if glue_tbl is None:
                 U.warn(f"{U.GLUE_DB}.{cfg['_glue_table']} no existe en el Catalog.")
                 U.info("Tabla nueva: no hay esquema que replicar; el JSON queda como esta.")
                 if not U.confirm("Seguir igual? [y/N]", destructivo=True):
@@ -857,10 +1234,10 @@ def run_flow(cfg, o):
                 if not o["no_sync"]:
                     if fuente is None:
                         fuente = columnas_origen(cfg)
-                    if paso_sync(cfg, g["Table"], fuente) is None:
+                    if paso_sync(cfg, glue_tbl, fuente) is None:
                         return False
                 print()
-                if not U.analyze(cfg, g["Table"]):
+                if not U.analyze(cfg, glue_tbl):
                     if not U.confirm("El JSON no calza con el destino. Seguir igual? [y/N]",
                                      destructivo=True):
                         return False
@@ -875,59 +1252,82 @@ def run_flow(cfg, o):
                 U.info(f"Para cargar:  flow {sel} --desde AAAA-MM-DD --hasta AAAA-MM-DD")
                 return True
 
+        # ── landing: lo que ya esta y es valido no se vuelve a bajar ──
+        tramos = [(o["desde"], o["hasta"])] if "disparar" in plan else []
+        sirven = None
+        if "landing" in plan:
+            paso("Revisando lo que ya esta en el landing")
+            sirven, descartes, faltan = revisar_landing(cfg, glue_tbl, rango, s, host, dag_id)
+            necesitan = sorted(set(faltan) | set(descartes))
+            print()
+            if not necesitan:
+                U.ok("Todo el rango ya esta en el landing y es valido: no se corre el UNLOAD.")
+                U.info("Para bajarlo igual de Redshift:  --forzar-unload")
+                tramos = []
+            else:
+                tramos = tramos_a_bajar(necesitan)
+                print(f"  UNLOAD solo para lo que falta ({len(necesitan)} fechas):")
+                for a, b in tramos:
+                    U.info(f"{a} .. {b}")
+
         # ── disparar y esperar ──
-        run_id, t0 = o["run_id"], None
-        if "disparar" in plan:
-            paso("Disparando el DAG de UNLOAD")
-            run_id, t0 = trigger_dag(s, host, dag_id, o["desde"], o["hasta"])
-            if not run_id:
-                return False
-
-        if "esperar" in plan:
-            paso("Esperando el UNLOAD")
-            if t0 is None:
-                r = api(s, host, "GET", f"dags/{dag_id}/dagRuns/{run_id}")
-                if not r:
-                    U.bad(f"No encontre el run '{run_id}'.")
+        corrio = False
+        if "disparar" in plan and not tramos:
+            paso.saltar("Disparar el DAG de UNLOAD", "todo el rango esta en el landing")
+            paso.saltar("Esperar el UNLOAD")
+        elif "esperar" in plan:
+            lista = tramos if "disparar" in plan else [None]   # None: retomar --run
+            for k, tramo in enumerate(lista):
+                run_id, t0 = o["run_id"], None
+                if tramo:
+                    if k == 0:
+                        paso("Disparando el DAG de UNLOAD")
+                    else:
+                        print()
+                        print(f"  {C.B}Tramo {k + 1}/{len(lista)}{C.END}")
+                    run_id, t0 = trigger_dag(s, host, dag_id, *tramo)
+                    if not run_id:
+                        return False
+                if k == 0:
+                    paso("Esperando el UNLOAD")
+                r = esperar_unload(cfg, s, host, dag_id, run_id, t0, sel)
+                if r is None:
                     return False
-                t0 = parse_iso(r.get("start_date")) or parse_iso(r.get("execution_date"))
-                if t0 is None:
-                    U.bad("El run no tiene fecha de inicio todavia.")
-                    return False
-            U.info("Ctrl-C corta la espera; el DAG sigue corriendo en MWAA.")
-            try:
-                state = wait_run(s, host, dag_id, run_id)
-            except MwaaNoDisponible as e:
-                U.bad(str(e))
-                U.info(f"El DAG sigue corriendo en MWAA (run {run_id}).")
-                U.info(f"Cuando vuelva la VPN:  flow {sel} --run {run_id}")
-                return False
-            if state != "success":
-                U.bad(f"El DAG termino en {state.upper()}. No se mueve nada.")
-                show_failed_tasks(s, host, dag_id, run_id)
-                return False
-            U.ok("UNLOAD completado.")
-
-            parts = particiones_de_la_corrida(cfg, t0)
-            if not parts:
-                U.bad("El UNLOAD termino OK pero no escribio particiones:")
-                U.info("el origen no tiene datos para ese rango.")
-                return False
-            print(f"  Esta corrida escribio {len(parts)} particiones: "
-                  f"{parts[0]} .. {parts[-1]}")
+                corrio = True
+                if o["run_id"]:
+                    conf = r.get("conf") or {}
+                    if conf.get("load_start") and conf.get("load_end"):
+                        rango = rango_a_parts(conf["load_start"], conf["load_end"])
+                    else:
+                        t_ini = parse_iso(r.get("start_date"))
+                        rango = particiones_de_la_corrida(cfg, t_ini) if t_ini else None
             if o["solo_dag"]:
-                U.info(f"Para mover:  flow {sel} --solo-mover "
-                       f"--desde {parts[0]} --hasta {parts[-1]}")
+                print()
+                U.info(f"Para mover:  flow {sel} --solo-mover"
+                       + (f" --desde {rango[0]} --hasta {rango[-1]}" if rango else ""))
                 return True
-            U.SOLO_PARTS, U.SOLO_PARTS_RANGO = parts, True
-
-        elif o["solo_mover"] and o["desde"] and o["hasta"]:
-            U.SOLO_PARTS = rango_a_parts(o["desde"], o["hasta"])
-            U.SOLO_PARTS_RANGO = True
 
         # ── mover y verificar ──
         paso("Moviendo a la tabla raw y registrando particiones")
-        U.move(cfg, use_msck=False)
+        if o["solo_mover"] and not rango and U.SOLO_PARTS:
+            rango = sorted({p.split("=", 1)[-1] for p in U.SOLO_PARTS})
+        if sirven is None or corrio:
+            print("  Validando el landing antes de mover:")
+            try:
+                sirven, _, faltan = revisar_landing(cfg, glue_tbl, rango, s, host, dag_id)
+            except RuntimeError as e:
+                U.bad(str(e))
+                return False
+            if corrio and faltan:
+                U.info(f"{len(faltan)} fechas sin datos en el origen: el UNLOAD no escribio nada.")
+        if not sirven:
+            U.bad("No hay particiones validas para mover en el landing.")
+            return False
+        U.SOLO_PARTS, U.SOLO_PARTS_RANGO = sirven, True
+        if not U.move(cfg, use_msck=False):
+            print()
+            U.bad("El movimiento no termino (detalle arriba): no se verifica todavia.")
+            return False
         paso("Verificacion final")
         okey = U.cmd_verificar(cfg)
 
@@ -966,6 +1366,7 @@ def main():
         "solo_dag": "--solo-dag" in flags, "solo_mover": "--solo-mover" in flags,
         "solo_sync": "--solo-sync" in flags, "solo_json": "--solo-json" in flags,
         "no_sync": "--no-sync" in flags, "prep": None,
+        "forzar_unload": "--forzar-unload" in flags,
     }
     U.AUTO = bool(flags & {"--auto", "--auto-borrar"})
     U.AUTO_BORRAR = "--auto-borrar" in flags
@@ -1036,8 +1437,10 @@ if __name__ == "__main__":
         U.info("No se disparo ni se movio nada. Conecta la VPN y volve a correr.")
         sys.exit(2)
     except KeyboardInterrupt:
-        print("\n  Interrumpido. Si el DAG ya estaba corriendo, sigue en MWAA:")
-        print("  retoma con  flow <tabla> --run <run_id>")
+        print("\n  Interrumpido.")
+        print("  - Si estaba esperando el DAG, sigue en MWAA:  flow <tabla> --run <run_id>")
+        print("  - Si estaba moviendo: lo movido ya quedo registrado; volve a correr el")
+        print("    mismo comando y sigue donde quedo.")
         sys.exit(130)
     except RuntimeError as e:
         U.bad(str(e))

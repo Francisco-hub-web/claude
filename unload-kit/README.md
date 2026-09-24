@@ -1,4 +1,4 @@
-# unload kit v9.2  (flow 2.2 · unload 5.0 · generador modo estricto)
+# unload kit v9.3  (flow 2.3 · unload 5.1 · generador modo estricto)
 
 Backfill desde Redshift (cuenta 595738433757) hacia tablas raw existentes
 (cuenta 608614369971). El esquema lo dicta la TABLA DESTINO.
@@ -44,6 +44,8 @@ generador los renderiza exactamente igual que antes.
     flow 7 --solo-dag --desde ... --hasta ...        dispara y espera, no mueve
     flow 7 --run manual__2026-09-16T19:12:17Z        retoma un run (VPN caida)
     flow 7 --solo-mover [--desde ... --hasta ...]    mueve lo que hay en el landing
+    flow 7 --desde ... --hasta ... --forzar-unload   baja todo de Redshift aunque
+                                                     ya este en el landing
     ... --no-sync | --auto | --auto-borrar
 
 Pasos:
@@ -53,22 +55,50 @@ Pasos:
     en ~/lakehousev2/unload-kit/backups/. Idempotente.
  2. Publica el JSON en S3 solo si difiere del publicado, y espera a que
     MWAA lo re-parsee (last_parsed_time) con el generador correcto.
- 3. Dispara el DAG con el rango por conf.
- 4. Espera. Tolera cortes breves de VPN; si se cae del todo te da el
+ 3. Revisa el landing (ver abajo): lo que ya esta y es valido NO se vuelve
+    a bajar de Redshift.
+ 4. Dispara el DAG solo para las fechas que faltan (un run por tramo
+    continuo, hasta 3; si estan muy salteadas, uno de punta a punta) y
+    espera. Tolera cortes breves de VPN; si se cae del todo te da el
     comando exacto:  flow 7 --run <run_id>
- 5. Mueve SOLO las particiones que escribio esta corrida (por fecha de
-    escritura en el landing): los restos de corridas anteriores se ignoran.
+ 5. Vuelve a validar el landing y mueve particion por particion.
  6. Registra particiones, verifica y limpia.
+
+## Reutiliza lo que ya esta en el landing
+
+Una particion del landing se mueve sin volver a correr el UNLOAD solo si:
+  - es posterior al JSON vigente (schema_synced_at);
+  - la escribio un run del DAG que termino OK (un run fallido puede dejar
+    archivos a medias);
+  - su parquet tiene exactamente las columnas y tipos de la tabla destino
+    (lee solo el footer de un archivo por particion: unos KB).
+Lo que no pasa, se vuelve a bajar, y flow muestra el motivo de cada una.
+Con --solo-mover y sin VPN no se puede consultar MWAA: valida solo fecha y
+esquema, y lo avisa.
+
+## Si se corta (SSO, red, disco, Ctrl-C)
+
+Volve a correr el MISMO comando. Lo ya movido queda en destino y
+registrado; al re-correr se salta (mismos archivos y tamanos que el
+landing) y lo que quedo bajado en disco no se vuelve a bajar. Si aws
+falla, flow muestra su codigo y mensaje, reintenta 2 veces y revisa si
+la sesion SSO vencio (UNLOAD_REINTENTOS para cambiar la cantidad).
 
 Columnas del destino que el origen no tiene -> NULL tipado (con aviso).
 Si un CAST es imposible (ej. texto -> int), falla el UNLOAD y no se mueve nada.
 
 ## Reemplazo seguro de particiones
 
-Las particiones que ya existen en destino se borran DESPUES de bajar los
-datos nuevos, justo antes de subirlos, y se verifica que el borrado ocurrio
-antes de subir (si no, no sube: nunca duplica). Un corte a mitad (SSO, red,
-crash) deja el destino intacto o recuperable re-corriendo.
+Se mueve una particion a la vez: bajar (copia local identica al landing,
+sin restos viejos) -> borrar la de destino si existia -> subir -> verificar
+archivo por archivo -> liberar el disco. El disco nunca necesita mas de
+una particion (+2 GB de margen, UNLOAD_MARGEN_DISCO_GB). La de destino se
+borra recien cuando la nueva esta completa en disco, y se confirma el
+borrado antes de subir: nunca duplica. Si la subida falla despues de
+borrar, flow lo avisa y la copia sigue en disco: re-correr la sube.
+
+`unload 7 --verificar` lista las particiones registradas sin datos (y cual
+comando las restaura: desde el landing si siguen ahi, o re-bajandolas).
 
 ## unload (pasos sueltos)
 
@@ -79,6 +109,7 @@ crash) deja el destino intacto o recuperable re-corriendo.
 
 ## Requisitos
 
-aws CLI; boto3 + requests (flow, como mwaa_cert); psycopg2 solo para
+aws CLI; boto3 + requests (flow: MWAA y lectura del footer de los parquet
+del landing, como mwaa_cert); psycopg2 solo para
 generar JSON de tablas nuevas o validar el origen (FLOW_RS_PASS).
 MWAA es privado: flow necesita la VPN para disparar/esperar.

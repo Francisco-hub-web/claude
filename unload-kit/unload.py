@@ -11,7 +11,10 @@ los lista numerados, y para el que elijas:
      (columnas que faltan, que sobran, particion, flag only_unload)
   3. detecta solapamiento de particiones y ofrece limpiarlas
   4. mueve two-hop (bajar + subir) porque la copia server-side
-     cross-account falla por KMS
+     cross-account falla por KMS, PARTICION POR PARTICION:
+     bajar -> reemplazar en destino -> subir -> verificar -> liberar disco.
+     Un corte deja lo ya movido en destino; re-correr retoma (se salta lo
+     que ya esta en destino con los mismos archivos).
   5. registra las particiones nuevas y valida
 
 Uso:
@@ -37,10 +40,11 @@ Uso:
 Solo usa la CLI de aws (nada de boto3 ni pip).
 """
 
-__version__ = "5.0"
+__version__ = "5.1"
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -146,12 +150,6 @@ def aws(args, profile, parse=True, check=True, quiet=True):
     return r.stdout
 
 
-def aws_stream(args, profile):
-    """Corre aws mostrando la salida en vivo (para sync)."""
-    cmd = ["aws"] + args + ["--profile", profile, "--region", REGION]
-    return subprocess.run(cmd).returncode == 0
-
-
 def check_session(profile):
     try:
         aws(["sts", "get-caller-identity"], profile)
@@ -191,61 +189,34 @@ def list_prefixes(bucket, prefix, profile, label="particiones", strict=False):
     return sorted(res)
 
 
-MAX_SCAN_PAGES = int(os.environ.get("UNLOAD_MAX_SCAN_PAGES", "200"))
+def particiones_s3(bucket, prefix, profile, base=None):
+    """{particion: {"n", "bytes", "archivos", "lm_min", "lm_max"}} bajo prefix.
 
-
-def summarize(bucket, prefix, profile, label="objetos"):
-    """(n_objetos, bytes, truncado) bajo prefix. Muestra progreso en vivo."""
-    total_n = total_b = 0
-    token = None
-    pages = 0
-    truncated = False
-    sys.stdout.write(f"  {C.DIM}escaneando {label}...{C.END}")
-    sys.stdout.flush()
-    while True:
-        args = ["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", prefix,
-                "--max-items", "1000"]
-        if token:
-            args += ["--starting-token", token]
-        out = aws(args, profile, check=False)
-        if not out:
-            break
-        for o in out.get("Contents", []) or []:
-            total_n += 1
-            total_b += o.get("Size", 0)
-        pages += 1
-        sys.stdout.write(f"\r  {C.DIM}escaneando {label}... {total_n} objetos, "
-                         f"{human(total_b)}{C.END}   ")
-        sys.stdout.flush()
-        token = out.get("NextToken")
-        if not token:
-            break
-        if pages >= MAX_SCAN_PAGES:
-            truncated = True
-            break
-    sys.stdout.write("\r" + " " * 70 + "\r")
-    sys.stdout.flush()
-    return total_n, total_b, truncated
-
-
-def tamanos_por_particion(bucket, prefix, profile):
-    """{particion: (objetos, bytes)} con UN listado paginado del prefijo."""
-    res, token = {}, None
-    while True:
-        args = ["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", prefix,
-                "--max-items", "1000"]
-        if token:
-            args += ["--starting-token", token]
-        out = aws(args, profile, check=False)
-        if not isinstance(out, dict):
-            break
-        for o in out.get("Contents", []) or []:
-            seg = o["Key"][len(prefix):].split("/", 1)[0]
-            n, b = res.get(seg, (0, 0))
-            res[seg] = (n + 1, b + o.get("Size", 0))
-        token = out.get("NextToken")
-        if not token:
-            break
+    UN solo llamado a la CLI (pagina sola): mucho mas rapido que un proceso
+    por pagina. 'particion' es la primera carpeta bajo base (por defecto
+    prefix); los archivos sueltos quedan bajo la clave "". "archivos" es
+    {nombre: tamano}: sirve para comparar dos copias de una particion.
+    Lanza RuntimeError si no puede listar (sesion SSO, permisos).
+    """
+    base = prefix if base is None else base
+    try:
+        out = aws(["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", prefix,
+                   "--query", "Contents[].[Key,Size,LastModified]"], profile)
+    except RuntimeError as e:
+        raise RuntimeError(f"No pude listar s3://{bucket}/{prefix} ({e})")
+    res = {}
+    for key, size, lm in out or []:
+        rel = key[len(base):]
+        part, _, nombre = rel.partition("/") if "/" in rel else ("", "", rel)
+        if not nombre:  # marcador de "carpeta" vacia
+            continue
+        d = res.setdefault(part, {"n": 0, "bytes": 0, "archivos": {},
+                                  "lm_min": lm, "lm_max": lm})
+        d["n"] += 1
+        d["bytes"] += size
+        d["archivos"][nombre] = size
+        d["lm_min"] = min(d["lm_min"], lm)
+        d["lm_max"] = max(d["lm_max"], lm)
     return res
 
 
@@ -258,25 +229,30 @@ def quedan_objetos(bucket, prefix, profile):
     return bool(isinstance(out, dict) and out.get("Contents"))
 
 
-def borrar_particiones(s3_dst, p_dst, parts):
-    """Borra particiones del destino y VERIFICA que no quede nada antes de seguir."""
-    for i, p in enumerate(parts, 1):
-        print(f"    [{i}/{len(parts)}] borrando {p}/")
-        aws(["s3", "rm", f"{s3_dst}{p}/", "--recursive", "--only-show-errors"],
-            PROFILE_DST, parse=False, check=False)
-    try:
-        vivas = set(list_prefixes(BUCKET_DST, p_dst, PROFILE_DST, "verificando", strict=True))
-    except RuntimeError as e:
-        bad(str(e))
-        info("No se sube nada: no pude confirmar el borrado.")
-        return False
-    quedan = sorted(set(parts) & vivas)
-    if quedan:
-        bad(f"{len(quedan)} particiones no se pudieron borrar (ej. {quedan[0]}).")
-        info("No se sube nada para no duplicar. Volve a correr: la copia local sigue.")
-        return False
-    ok(f"{len(parts)} particiones borradas en destino.")
-    return True
+def bloques(fechas):
+    """[(desde, hasta, n)] agrupando fechas consecutivas (YYYY-MM-DD)."""
+    from datetime import date, timedelta
+    out = []
+    for f in sorted(set(fechas)):
+        try:
+            d = date.fromisoformat(f)
+        except ValueError:
+            out.append((f, f, 1))
+            continue
+        if out and isinstance(out[-1][1], date) and d - out[-1][1] == timedelta(days=1):
+            out[-1] = (out[-1][0], d, out[-1][2] + 1)
+        else:
+            out.append((d, d, 1))
+    return [(str(a), str(b), n) for a, b, n in out]
+
+
+def rangos(fechas, max_bloques=6):
+    """'2025-01-01..2025-01-31 (31), 2025-03-05' para mostrar muchas fechas."""
+    bs = bloques(fechas)
+    txt = [a if n == 1 else f"{a}..{b} ({n})" for a, b, n in bs[:max_bloques]]
+    if len(bs) > max_bloques:
+        txt.append(f"... y {len(bs) - max_bloques} tramos mas")
+    return ", ".join(txt)
 
 
 def human(n):
@@ -305,17 +281,6 @@ def count_partitions(cfg):
         if not token:
             break
     return n
-
-
-def sample_partition_location(cfg):
-    """Location de una particion cualquiera (para detectar rutas mal armadas)."""
-    out = aws(["glue", "get-partitions", "--database-name", GLUE_DB,
-               "--table-name", cfg["_glue_table"], "--max-items", "1"],
-              PROFILE_DST, check=False)
-    if not out or not out.get("Partitions"):
-        return None
-    p = out["Partitions"][0]
-    return p["Values"][0], p["StorageDescriptor"].get("Location", "")
 
 
 class KeepAwake:
@@ -696,9 +661,19 @@ def validate(cfg, parts):  # noqa: legacy
 
 
 
+def particiones_glue(cfg):
+    """{valor: Location} de todas las particiones registradas (la CLI pagina sola)."""
+    out = aws(["glue", "get-partitions", "--database-name", GLUE_DB,
+               "--table-name", cfg["_glue_table"],
+               "--query", "Partitions[].[Values[0], StorageDescriptor.Location]"],
+              PROFILE_DST)
+    return {v: (loc or "") for v, loc in (out or [])}
+
+
 def cmd_verificar(cfg):
     """Chequeo profundo de una tabla ya movida."""
     schema, table = cfg["schema"], cfg["table"]
+    col = cfg.get("column_dt", "calendar_dt")
     p_dst = PREFIX_DST_TPL.format(schema=schema, table=table)
     s3_dst = f"s3://{BUCKET_DST}/{p_dst}"
 
@@ -706,10 +681,15 @@ def cmd_verificar(cfg):
     print(f"  {s3_dst}\n")
 
     parts_s3 = list_prefixes(BUCKET_DST, p_dst, PROFILE_DST, "carpetas en S3")
-    n_glue = count_partitions(cfg)
+    try:
+        glue = particiones_glue(cfg)
+    except RuntimeError as e:
+        bad(f"No pude leer las particiones del Catalog: {e}")
+        return False
+    vals_s3 = {p.split("=", 1)[1] for p in parts_s3 if "=" in p}
 
-    print(f"  Carpetas calendar_dt= en S3        : {len(parts_s3)}")
-    print(f"  Particiones en el Glue Catalog     : {n_glue}")
+    print(f"  Carpetas {col}= en S3{' ' * max(1, 20 - len(col))}: {len(parts_s3)}")
+    print(f"  Particiones en el Glue Catalog     : {len(glue)}")
     print()
 
     problemas = []
@@ -721,15 +701,32 @@ def cmd_verificar(cfg):
             return False
         bad("No hay datos en S3.")
         problemas.append("sin datos")
-    elif n_glue == len(parts_s3):
-        ok("Coinciden: todas las particiones estan registradas.")
-    elif n_glue < len(parts_s3):
-        bad(f"Faltan {len(parts_s3) - n_glue} particiones por registrar.")
+
+    sin_registrar = sorted(vals_s3 - set(glue))
+    huerfanas = sorted(set(glue) - vals_s3)
+    fuera = [v for v in huerfanas
+             if not glue[v].rstrip("/").startswith(s3_dst.rstrip("/"))]
+    vacias = [v for v in huerfanas if v not in fuera]
+
+    if parts_s3 and not sin_registrar and not huerfanas:
+        ok("Coinciden: cada carpeta esta registrada y cada particion tiene datos.")
+    if sin_registrar:
+        bad(f"{len(sin_registrar)} carpetas con datos SIN registrar:")
+        info(rangos(sin_registrar))
         info(f"Registralas con:  unload {table} --particiones")
         problemas.append("faltan particiones")
-    else:
-        warn(f"Hay {n_glue - len(parts_s3)} particiones registradas sin datos en S3.")
-        problemas.append("particiones huerfanas")
+    if vacias:
+        print()
+        warn(f"{len(vacias)} particiones registradas SIN datos en S3 (Athena las ve vacias):")
+        info(rangos(vacias))
+        _como_recuperar(cfg, vacias)
+        problemas.append("particiones registradas sin datos")
+    if fuera:
+        print()
+        warn(f"{len(fuera)} particiones registradas apuntan FUERA de la ruta de la tabla:")
+        info(rangos(fuera))
+        info(f"ej. {fuera[0]} -> {glue[fuera[0]]}")
+        problemas.append("particiones con Location en otra ruta")
 
     # Location de la tabla vs realidad
     g = aws(["glue", "get-table", "--database-name", GLUE_DB,
@@ -746,18 +743,8 @@ def cmd_verificar(cfg):
             info("No rompe hoy (cada particion lleva su Location), pero cualquier")
             info("herramienta que derive rutas del Location de la tabla va a fallar.")
             info(f"Corregir con:  unload {table} --fix-location")
-
-    # Location de una particion de muestra
-    samp = sample_partition_location(cfg)
-    if samp:
-        val, loc = samp
-        print()
-        if loc.rstrip("/").startswith(s3_dst.rstrip("/")):
-            ok(f"Particion de muestra ({val}) apunta bien.")
-        else:
-            bad(f"Particion {val} apunta a una ruta distinta:")
-            info(loc)
-            problemas.append("particiones con Location incorrecto")
+    if glue and not fuera:
+        ok("Todas las particiones registradas apuntan a la ruta de la tabla.")
 
     print()
     if problemas:
@@ -765,6 +752,38 @@ def cmd_verificar(cfg):
     else:
         ok("Todo consistente.")
     return not problemas
+
+
+def _como_recuperar(cfg, fechas):
+    """Dice de donde se pueden restaurar particiones que quedaron sin datos."""
+    col = cfg.get("column_dt", "calendar_dt")
+    table = cfg["table"]
+    p_src = PREFIX_SRC_TPL.format(schema=cfg["schema"], table=table)
+    try:
+        landing = {p.split("=", 1)[1] for p in
+                   list_prefixes(BUCKET_SRC, p_src, PROFILE_SRC, "landing", strict=True)
+                   if p.startswith(col + "=")}
+    except RuntimeError as e:
+        info(f"No pude revisar el landing: {e}")
+        return
+    en_landing = sorted(set(fechas) & landing)
+    resto = sorted(set(fechas) - landing)
+    if en_landing:
+        f = Path(STAGING) / f"{table}.restaurar.txt"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("\n".join(en_landing) + "\n")
+        info("")
+        info(f"{len(en_landing)} siguen en el landing; flow las valida y, si sirven, las")
+        info("restaura sin volver a bajarlas de Redshift:")
+        info(f"  flow {table} --solo-mover --particiones-archivo {f}")
+    if resto:
+        info("")
+        info(f"{len(resto)} ya no estan en el landing: hay que volver a bajarlas de Redshift:")
+        bs = bloques(resto)
+        for a, b, _ in bs[:5]:
+            info(f"  flow {table} --desde {a} --hasta {b}")
+        if len(bs) > 5:
+            info(f"  ... y {len(bs) - 5} tramos mas")
 
 
 def cmd_fix_location(cfg):
@@ -851,7 +870,161 @@ def cmd_estado(defs):
 
 # ---------------------------------------------------------------- mover
 
+REINTENTOS = int(os.environ.get("UNLOAD_REINTENTOS", "3"))
+# Espacio libre que se deja siempre en el disco local, ademas de la particion.
+MARGEN_DISCO = int(float(os.environ.get("UNLOAD_MARGEN_DISCO_GB", "2")) * (1 << 30))
+
+# Codigos de salida de la CLI de aws (docs: "Return codes")
+AWS_RC = {
+    1: "fallo al menos una transferencia",
+    2: "se omitieron archivos",
+    130: "interrumpido (Ctrl-C)",
+    252: "comando invalido",
+    253: "credenciales o configuracion invalidas",
+    254: "S3 devolvio un error",
+    255: "error general de la CLI",
+}
+
+
+def dur(seg):
+    seg = int(seg)
+    if seg < 60:
+        return f"{seg}s"
+    if seg < 3600:
+        return f"{seg // 60}m {seg % 60:02d}s"
+    return f"{seg // 3600}h {seg % 3600 // 60:02d}m"
+
+
+def disco_libre(path):
+    p = Path(path)
+    while not p.exists():
+        p = p.parent
+    return shutil.disk_usage(p).free
+
+
+def archivos_locales(d):
+    """{nombre: tamano} de una carpeta local (mismo formato que particiones_s3)."""
+    d = Path(d)
+    if not d.is_dir():
+        return {}
+    return {f.relative_to(d).as_posix(): f.stat().st_size
+            for f in d.rglob("*") if f.is_file()}
+
+
+def sync_s3(src, dst, profile, que, extra=()):
+    """aws s3 sync con reintentos. Si falla, muestra el codigo y el error REAL de aws.
+
+    sync es reanudable: cada reintento sigue donde quedo el anterior.
+    """
+    cuenta = ACCOUNT_SRC if profile == PROFILE_SRC else ACCOUNT_DST
+    cmd = ["aws", "s3", "sync", src, dst, "--only-show-errors", *extra,
+           "--profile", profile, "--region", REGION]
+    for intento in range(1, REINTENTOS + 1):
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if r.returncode == 0:
+            return True
+        rc = r.returncode
+        motivo = f"terminado por la senal {-rc}" if rc < 0 else AWS_RC.get(rc, "error")
+        print()
+        bad(f"Fallo la {que}: aws s3 sync salio con codigo {rc} ({motivo}).")
+        lineas = [l for l in (r.stderr + "\n" + r.stdout).splitlines() if l.strip()]
+        for l in lineas[-4:]:
+            info(l[:220])
+        if not lineas:
+            info("aws no mostro ningun mensaje.")
+        if not check_session(profile):
+            bad(f"La sesion SSO de {cuenta} expiro: esa es la causa.")
+            info(f"aws sso login --profile {profile}   y volve a correr el mismo comando.")
+            return False
+        if intento < REINTENTOS:
+            espera = 15 * intento
+            info(f"Reintento {intento}/{REINTENTOS - 1} en {espera}s (sigue donde quedo)...")
+            time.sleep(espera)
+    return False
+
+
+def transferir(parts, reemplazar, s3_src, s3_dst, p_dst, local, tam, movidas):
+    """Mueve particion por particion; agrega cada una a 'movidas' apenas queda
+    verificada en destino (asi un Ctrl-C no pierde la cuenta). Devuelve la
+    particion donde se corto, o None si movio todas.
+
+    Por cada particion:
+      1. baja del landing con --delete (la copia local queda identica al
+         landing: sin restos de corridas viejas que se subirian como duplicados)
+         y comprueba archivos y tamanos;
+      2. si ya existia en destino, la borra y confirma que no quedo nada;
+      3. la sube y comprueba que en destino quedo exactamente lo del landing;
+      4. borra la copia local: el disco nunca necesita mas de una particion.
+    Si algo falla, lo ya movido queda en destino y lo bajado queda en disco.
+    """
+    total = sum(tam[p]["bytes"] for p in parts)
+    hecho, t0 = 0, time.time()
+    for i, part in enumerate(parts, 1):
+        t, lp, tp = tam[part], local / part, time.time()
+        print(f"  [{i}/{len(parts)}] {part}  {C.DIM}{t['n']} archivos, "
+              f"{human(t['bytes'])}{C.END}", end="  ", flush=True)
+
+        falta_bajar = t["bytes"] - sum(archivos_locales(lp).values())
+        libre = disco_libre(local)
+        if libre < falta_bajar + MARGEN_DISCO:
+            print()
+            bad(f"Sin espacio en disco: libres {human(libre)}, esta particion necesita "
+                f"{human(falta_bajar)} + {human(MARGEN_DISCO)} de margen.")
+            info("Libera espacio o usa otra carpeta:  export UNLOAD_STAGING=/ruta/con/espacio")
+            return part
+
+        print("bajando", end="... ", flush=True)
+        if not sync_s3(f"{s3_src}{part}/", f"{lp}/", PROFILE_SRC, "descarga", ["--delete"]):
+            return part
+        if archivos_locales(lp) != t["archivos"]:
+            print()
+            bad("La copia local no coincide con el landing (archivos o tamanos).")
+            return part
+
+        if part in reemplazar:
+            print("reemplazando", end="... ", flush=True)
+            aws(["s3", "rm", f"{s3_dst}{part}/", "--recursive", "--only-show-errors"],
+                PROFILE_DST, parse=False, check=False)
+            try:
+                quedan = quedan_objetos(BUCKET_DST, f"{p_dst}{part}/", PROFILE_DST)
+            except RuntimeError as e:
+                print()
+                bad(str(e))
+                info("No se sube nada: no pude confirmar el borrado.")
+                return part
+            if quedan:
+                print()
+                bad("No se pudo borrar la particion en destino; no se sube para no duplicar.")
+                return part
+
+        print("subiendo", end="... ", flush=True)
+        subio = sync_s3(f"{lp}/", f"{s3_dst}{part}/", PROFILE_DST, "subida")
+        dst, err = {}, None
+        if subio:
+            try:
+                dst = particiones_s3(BUCKET_DST, f"{p_dst}{part}/", PROFILE_DST, base=p_dst)
+            except RuntimeError as e:
+                err = str(e)
+        if not subio or (dst.get(part) or {}).get("archivos") != t["archivos"]:
+            if subio:
+                print()
+                bad(err or "Lo que quedo en destino no coincide con el landing.")
+            if part in reemplazar:
+                warn(f"{part} ya se habia borrado en destino y no quedo completa:")
+                info(f"la copia esta en {lp}; re-correr la sube antes que nada.")
+            return part
+
+        shutil.rmtree(lp, ignore_errors=True)
+        movidas.append(part)
+        hecho += t["bytes"]
+        eta = (time.time() - t0) / hecho * (total - hecho) if hecho else 0
+        resto = f" · quedan ~{dur(eta)}" if i < len(parts) else ""
+        print(f"{C.OK}✓{C.END} {C.DIM}{dur(time.time() - tp)}{resto}{C.END}")
+    return None
+
+
 def move(cfg, use_msck):
+    """Mueve el landing al destino. True si todo quedo movido y registrado."""
     schema, table = cfg["schema"], cfg["table"]
     name_part = cfg.get("column_dt", "calendar_dt")
     p_src = PREFIX_SRC_TPL.format(schema=schema, table=table)
@@ -862,8 +1035,14 @@ def move(cfg, use_msck):
 
     title("Origen")
     print(f"  {s3_src}")
-    parts_src = list_prefixes(BUCKET_SRC, p_src, PROFILE_SRC)
-    n_src, b_src, trunc = summarize(BUCKET_SRC, p_src, PROFILE_SRC, "origen")
+    try:
+        tam_src = particiones_s3(BUCKET_SRC, p_src, PROFILE_SRC)
+    except RuntimeError as e:
+        bad(str(e))
+        return False
+    parts_src = sorted(p for p in tam_src if "=" in p)
+    n_src = sum(v["n"] for v in tam_src.values())
+    b_src = sum(v["bytes"] for v in tam_src.values())
     if n_src == 0:
         if ARGS_ANALIZAR:
             # Con --analizar el origen vacio no importa: el analisis compara
@@ -873,9 +1052,8 @@ def move(cfg, use_msck):
         else:
             bad("No hay nada en el origen.")
             info("Corriste el DAG de UNLOAD para esta tabla?")
-            return
-    sufijo = "+ (truncado)" if trunc else ""
-    print(f"  {n_src} objetos, {human(b_src)} {sufijo}, {len(parts_src)} particiones")
+            return False
+    print(f"  {n_src} objetos, {human(b_src)}, {len(parts_src)} particiones")
 
     if SOLO_PARTS:
         pedidas = {p if p.startswith(f"{name_part}=") else f"{name_part}={p}"
@@ -884,11 +1062,11 @@ def move(cfg, use_msck):
         parts_src = sorted(pedidas & set(parts_src))
         print()
         if SOLO_PARTS_RANGO:
-            info(f"Se mueven solo {len(parts_src)} particiones (las de esta corrida / rango).")
+            info(f"Se mueven solo {len(parts_src)} particiones (las validadas / del rango).")
             if parts_src:
                 info(f"{parts_src[0]}  ..  {parts_src[-1]}")
             if faltan:
-                info(f"{len(faltan)} fechas del rango no tienen datos en el landing.")
+                info(f"{len(faltan)} fechas pedidas no tienen datos en el landing.")
         else:
             warn(f"Filtro activo: solo {len(parts_src)} de las particiones del origen.")
             for p in parts_src[:10]:
@@ -900,13 +1078,13 @@ def move(cfg, use_msck):
                 for p in faltan[:10]:
                     info(f"- {p}")
                 if not confirm("Seguir con las que si estan? [y/N]"):
-                    return
+                    return False
         if not parts_src:
             bad("Ninguna de las particiones pedidas esta en el origen.")
-            return
-    if parts_src:
+            return False
+    elif parts_src:
         info(f"{parts_src[0]}  ..  {parts_src[-1]}")
-    else:
+    elif n_src:
         warn("Sin particiones: el UNLOAD salio plano (falta only_unload en el JSON?)")
 
     title("Destino")
@@ -936,168 +1114,146 @@ def move(cfg, use_msck):
     compatible = analyze(cfg, glue_tbl)
 
     if ARGS_ANALIZAR:
-        return
+        return True
 
     if not compatible:
         print()
         if not confirm("El analisis encontro problemas. Mover igual? [y/N]", destructivo=True):
             print("  Cancelado.")
-            return
+            return False
+
+    if not parts_src:
+        return _mover_plano(s3_src, s3_dst, local)
 
     # -- solapamiento
     title("Solapamiento")
     over = sorted(set(parts_src) & set(parts_dst))
-    print(f"  Particiones solapadas: {len(over)}")
-
-    # Caso tipico: ya moviste esta tabla antes. No hay nada que transferir,
-    # solo (quiza) registrar particiones. Borrar seria tirar el trabajo hecho.
-    # Con filtro explicito la intencion es reemplazar justo esas particiones,
-    # asi que la deteccion de "ya movido" no aplica: seguir al borrado+subida.
-    if SOLO_PARTS and over:
-        info("Filtro activo: se reemplazan estas particiones aunque ya existan.")
-    elif over and len(over) == len(parts_src):
-        n_glue = count_partitions(cfg)
-        print()
-        warn("TODAS las particiones del origen ya estan en el destino.")
-        info("Parece que esta tabla ya fue movida.")
-        info(f"Particiones en S3 destino: {len(parts_dst)}  |  en el Catalog: {n_glue}")
-        print()
-        if n_glue >= len(parts_dst):
-            ok("Ademas ya estan todas registradas: no hay nada que hacer.")
-            info(f"Para revisar en detalle:  unload {table} --verificar")
-            return
-        print("  Opciones:")
-        print("    1. registrar las particiones que faltan (no transfiere nada)")
-        print("    2. borrar el destino y volver a subir todo")
-        print("    3. cancelar")
-        r = input("\n  Que hago? [1/2/3] ").strip()
-        if r == "1":
-            g = aws(["glue", "get-table", "--database-name", GLUE_DB,
-                     "--name", cfg["_glue_table"]], PROFILE_DST, check=False)
-            if g:
-                register_glue(cfg, parts_dst, g["Table"], s3_dst)
-            return
-        if r != "2":
-            print("  Cancelado.")
-            return
-
+    iguales = []
     if over:
-        warn("Estas fechas ya existen en destino. s3 sync NO las reemplaza:")
+        # una particion con los mismos archivos (nombre y tamano) que el landing
+        # ya fue movida: no se transfiere de nuevo. Asi re-correr tras un corte
+        # sigue donde quedo en vez de reemplazar todo otra vez.
+        try:
+            tam_dst = particiones_s3(BUCKET_DST, p_dst + os.path.commonprefix(over),
+                                     PROFILE_DST, base=p_dst)
+        except RuntimeError as e:
+            bad(str(e))
+            return False
+        iguales = [p for p in over
+                   if (tam_dst.get(p) or {}).get("archivos") == tam_src[p]["archivos"]]
+    reemplazar = [p for p in over if p not in iguales]
+    pendientes = [p for p in parts_src if p not in iguales]
+
+    print(f"  Particiones que ya existen en destino: {len(over)}")
+    if iguales:
+        ok(f"{len(iguales)} ya estan en destino con los mismos archivos: no se transfieren.")
+    if reemplazar:
+        warn(f"{len(reemplazar)} existen en destino con OTROS archivos. s3 sync no las reemplaza:")
         warn("los archivos nuevos tienen otro nombre y las filas quedarian DUPLICADAS.")
-        for p in over[:8]:
-            info(f"- {p}")
-        if len(over) > 8:
-            info(f"... y {len(over) - 8} mas")
+        info(rangos([p.split("=", 1)[1] for p in reemplazar]))
         print()
-        if not confirm(f"Reemplazar esas {len(over)} particiones en destino? [y/N]",
+        if not confirm(f"Reemplazar esas {len(reemplazar)} particiones en destino? [y/N]",
                        destructivo=True):
             bad("Cancelado: subir sin borrar dejaria duplicados.")
-            return
-        info("Se borran DESPUES de bajar los datos nuevos, justo antes de subirlos:")
-        info("si algo falla antes (SSO, red, crash), el destino queda intacto.")
-    else:
+            return False
+        info("Cada una se borra DESPUES de bajar sus datos nuevos, justo antes de subirlos:")
+        info("si algo falla antes (SSO, red, disco), esa particion queda intacta.")
+    elif not over:
         ok("Sin solapamiento.")
 
+    if not pendientes:
+        print()
+        ok("No hay nada que transferir: todo el landing ya esta en destino.")
+        return _registrar(cfg, iguales, glue_tbl, s3_dst, use_msck)
+
+    b_pend = sum(tam_src[p]["bytes"] for p in pendientes)
+    n_pend = sum(tam_src[p]["n"] for p in pendientes)
+    mayor = max(tam_src[p]["bytes"] for p in pendientes)
     print()
-    if SOLO_PARTS:
-        # b_src se midio sobre el prefijo completo, antes del filtro: recalcular
-        # solo sobre las particiones filtradas para no mostrar un total enganoso.
-        tam = tamanos_por_particion(BUCKET_SRC, p_src, PROFILE_SRC)
-        n_sel = sum(tam.get(pt, (0, 0))[0] for pt in parts_src)
-        b_sel = sum(tam.get(pt, (0, 0))[1] for pt in parts_src)
-        print(f"  Se van a mover {human(b_sel)} en {len(parts_src)} particiones "
-              f"({n_sel} objetos).")
-        info(f"El landing completo pesa {human(b_src)}; el filtro mueve solo lo de arriba.")
-    else:
-        print(f"  Se van a mover {human(b_src)} en {len(parts_src)} particiones.")
+    print(f"  Se van a mover {human(b_pend)} en {len(pendientes)} particiones ({n_pend} objetos).")
     print(f"  {C.DIM}two-hop (bajar+subir): la copia server-side cross-account")
-    print(f"  falla por kms:GenerateDataKey.{C.END}")
+    print("  falla por kms:GenerateDataKey. Una particion a la vez: bajar,")
+    print(f"  reemplazar, subir, verificar y liberar el disco.{C.END}")
+    print(f"  Disco libre en {STAGING}: {human(disco_libre(local))}  "
+          f"{C.DIM}(particion mas grande: {human(mayor)}){C.END}")
     print()
     if not confirm("Continuar con la transferencia? [y/N]"):
         print("  Cancelado.")
-        return
+        return False
 
-    with KeepAwake():
-        # -- bajar
-        title("Bajando desde " + ACCOUNT_SRC)
-        local.mkdir(parents=True, exist_ok=True)
-        if SOLO_PARTS:
-            # Con filtro se sincroniza particion por particion: un sync del
-            # prefijo completo se traeria todo el landing.
-            for i, part in enumerate(parts_src, 1):
-                print(f"  [{i}/{len(parts_src)}] {part}")
-                if not aws_stream(["s3", "sync", f"{s3_src}{part}/",
-                                   str(local / part) + "/"], PROFILE_SRC):
-                    bad(f"Fallo la descarga de {part}.")
-                    return
-        elif not aws_stream(["s3", "sync", s3_src, str(local) + "/"], PROFILE_SRC):
-            bad("Fallo la descarga. Volve a correr: sync es reanudable.")
-            return
-        nloc = len(list(local.rglob("*.parquet")))
-        ok(f"{nloc} parquet en {local}")
+    title(f"Moviendo {ACCOUNT_SRC} -> {ACCOUNT_DST}")
+    local.mkdir(parents=True, exist_ok=True)
+    movidas, corte = [], None
+    t0 = time.time()
+    try:
+        with KeepAwake():
+            corte = transferir(pendientes, set(reemplazar), s3_src, s3_dst,
+                               p_dst, local, tam_src, movidas)
+    finally:
+        # Lo movido se registra aunque se corte o se interrumpa: si no, quedaria
+        # en S3 sin que Athena lo vea. (Si no se puede ahora, se registra al
+        # re-correr: esas particiones pasan a estar "en destino con los mismos
+        # archivos" y se registran igual.)
+        a_registrar = sorted(set(movidas) | set(iguales))
+        good = True
+        if a_registrar and not check_session(PROFILE_DST):
+            print()
+            warn(f"Sesion SSO de {ACCOUNT_DST} vencida: el registro en Glue queda para la re-corrida.")
+            good = False
+        elif a_registrar:
+            good = _registrar(cfg, a_registrar, glue_tbl, s3_dst, use_msck)
 
-        # -- subir
-        title("Subiendo a " + ACCOUNT_DST)
-        if not check_session(PROFILE_DST):
-            bad(f"La sesion SSO de {ACCOUNT_DST} expiro. No se borro ni subio nada.")
-            info(f"aws sso login --profile {PROFILE_DST}")
-            info("Despues:  flow <tabla> --solo-mover   (no vuelve a bajar)")
-            return
-        if over:
-            print("  Reemplazando particiones existentes:")
-            if not borrar_particiones(s3_dst, p_dst, over):
-                return
-        if SOLO_PARTS:
-            for i, part in enumerate(parts_src, 1):
-                print(f"  [{i}/{len(parts_src)}] {part}")
-                if not aws_stream(["s3", "sync", str(local / part) + "/",
-                                   f"{s3_dst}{part}/"], PROFILE_DST):
-                    bad(f"Fallo la subida de {part}.")
-                    return
-        elif not aws_stream(["s3", "sync", str(local) + "/", s3_dst], PROFILE_DST):
-            bad("Fallo la subida. Volve a correr: sync es reanudable.")
-            return
+    if corte:
+        print()
+        bad(f"Se corto en {corte}: {len(movidas)} de {len(pendientes)} particiones "
+            f"quedaron movidas{' y registradas' if good else ''} ({dur(time.time() - t0)}).")
+        info("Las demas estan intactas en destino. Volve a correr el MISMO comando:")
+        info("se salta lo que ya esta en destino y lo bajado en disco no se vuelve a bajar.")
+        return False
+    ok(f"{len(movidas)} particiones movidas y verificadas en {dur(time.time() - t0)}.")
+    if not good:
+        return False
 
-    # -- verificar: un sync --dryrun vacio = todo subido
-    title("Verificacion")
-    if SOLO_PARTS:
-        pend = []
-        for part in parts_src:
-            o = aws(["s3", "sync", str(local / part) + "/", f"{s3_dst}{part}/",
-                     "--dryrun"], PROFILE_DST, parse=False, check=False)
-            pend += [l for l in (o or "").splitlines() if l.strip()]
-        out = "\n".join(pend)
+    title("Listo")
+    n_glue = count_partitions(cfg)
+    parts_final = list_prefixes(BUCKET_DST, p_dst, PROFILE_DST, "destino")
+    print(f"  Carpetas en S3 : {len(parts_final)}")
+    print(f"  En el Catalog  : {n_glue}")
+    if n_glue == len(parts_final):
+        ok("Coinciden.")
     else:
-        out = aws(["s3", "sync", str(local) + "/", s3_dst, "--dryrun"],
-                  PROFILE_DST, parse=False, check=False)
-    pending = [l for l in (out or "").splitlines() if l.strip()]
-    if pending:
-        bad(f"Quedaron {len(pending)} archivos sin subir. Volve a correr.")
-        return
-    ok("Todos los archivos estan en destino.")
+        warn("No coinciden; el detalle esta en la verificacion.")
+    cleanup(cfg, local, s3_src, parts_src if SOLO_PARTS else None)
+    return True
 
-    # -- particiones
+
+def _registrar(cfg, parts, glue_tbl, s3_dst, use_msck):
     title("Registro de particiones")
     if use_msck:
-        good = register_msck(cfg)
-    else:
-        if glue_tbl is None:
-            bad("Sin tabla en el Catalog no puedo registrar particiones.")
-            good = False
-        else:
-            good = register_glue(cfg, parts_src, glue_tbl, s3_dst)
+        return register_msck(cfg)
+    if glue_tbl is None:
+        bad("Sin tabla en el Catalog no puedo registrar particiones.")
+        return False
+    return register_glue(cfg, parts, glue_tbl, s3_dst)
 
-    if good:
-        title("Listo")
-        n_glue = count_partitions(cfg)
-        parts_final = list_prefixes(BUCKET_DST, p_dst, PROFILE_DST, "destino")
-        print(f"  Carpetas en S3 : {len(parts_final)}")
-        print(f"  En el Catalog  : {n_glue}")
-        if n_glue == len(parts_final):
-            ok("Coinciden.")
-        else:
-            warn("No coinciden; revisa con --verificar")
-        cleanup(cfg, local, s3_src, parts_src if SOLO_PARTS else None)
+
+def _mover_plano(s3_src, s3_dst, local):
+    """UNLOAD sin particiones (legado): baja y sube el prefijo completo."""
+    title("Bajando desde " + ACCOUNT_SRC)
+    local.mkdir(parents=True, exist_ok=True)
+    with KeepAwake():
+        if not sync_s3(s3_src, str(local) + "/", PROFILE_SRC, "descarga", ["--delete"]):
+            return False
+        title("Subiendo a " + ACCOUNT_DST)
+        if not sync_s3(str(local) + "/", s3_dst, PROFILE_DST, "subida"):
+            return False
+    out = aws(["s3", "sync", str(local) + "/", s3_dst, "--dryrun"],
+              PROFILE_DST, parse=False, check=False)
+    if out is None or out.strip():
+        bad("Quedaron archivos sin subir. Volve a correr.")
+        return False
+    ok("Todos los archivos estan en destino.")
+    return True
 
 
 # ---------------------------------------------------------------- main
