@@ -40,7 +40,7 @@ Uso:
 Solo usa la CLI de aws (nada de boto3 ni pip).
 """
 
-__version__ = "5.1"
+__version__ = "5.2"
 
 import json
 import os
@@ -100,14 +100,26 @@ if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
     C.off()
 
 
-def confirm(prompt, destructivo=False):
-    """input() salvo en modo AUTO. Los destructivos exigen AUTO_BORRAR."""
+def confirm(prompt, destructivo=False, riesgo=False):
+    """input() salvo en modo AUTO.
+
+    destructivo: borra datos; en AUTO lo contesta solo AUTO_BORRAR.
+    riesgo: seguir pese a un problema detectado; en AUTO siempre es NO (esa
+            tabla se corta y, en una cola, se sigue con la siguiente).
+    En una cola (NO_INTERACTIVO) nunca se espera el teclado: lo no autorizado es NO.
+    """
+    if AUTO and riesgo:
+        print(f"  {prompt} {C.DIM}[auto: no]{C.END}")
+        return False
     if AUTO and not destructivo:
         print(f"  {prompt} {C.DIM}[auto: si]{C.END}")
         return True
     if AUTO and destructivo and AUTO_BORRAR:
         print(f"  {prompt} {C.DIM}[auto-borrar: si]{C.END}")
         return True
+    if NO_INTERACTIVO:
+        print(f"  {prompt} {C.DIM}[cola: no, no autorizaste borrar]{C.END}")
+        return False
     return input(f"  {prompt} ").strip().lower() in ("y", "s", "si", "yes")
 
 
@@ -124,7 +136,11 @@ def warn(txt):
     print(f"  {C.WARN}!{C.END} {txt}")
 
 
+ERRORES = []   # errores mostrados (la cola resume el primero de cada tabla)
+
+
 def bad(txt):
+    ERRORES.append(txt)
     print(f"  {C.ERR}✗{C.END} {txt}")
 
 
@@ -1118,7 +1134,7 @@ def move(cfg, use_msck):
 
     if not compatible:
         print()
-        if not confirm("El analisis encontro problemas. Mover igual? [y/N]", destructivo=True):
+        if not confirm("El analisis encontro problemas. Mover igual? [y/N]", riesgo=True):
             print("  Cancelado.")
             return False
 
@@ -1261,6 +1277,7 @@ def _mover_plano(s3_src, s3_dst, local):
 ARGS_ANALIZAR = False
 AUTO = False          # responde solo los pasos seguros
 AUTO_BORRAR = False   # responde solo tambien los destructivos
+NO_INTERACTIVO = False  # cola: nunca espera el teclado
 SOLO_PARTS = None     # si no es None: mover solo estas particiones
 SOLO_PARTS_RANGO = False  # el filtro viene de un rango/corrida: sin preguntas por faltantes
 

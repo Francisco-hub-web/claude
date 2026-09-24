@@ -11,6 +11,7 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$DEST"
 cp "${SRC}/unload.py" "${DEST}/unload.py"
 cp "${SRC}/flow.py"   "${DEST}/flow.py"
+cp "${SRC}/pedido.py" "${DEST}/pedido.py"
 cp "${SRC}/README.md" "${DEST}/README.md" 2>/dev/null || true
 mkdir -p "${DEST}/generator" "${DEST}/backups"
 cp "${SRC}/generator/"*.py "${DEST}/generator/" 2>/dev/null || true
@@ -57,3 +58,5 @@ echo "  unload fact_obsolescence --analizar"
 echo "  unload --estado"
 echo ""
 echo "  flow 6 --desde 2026-01-01 --hasta 2026-08-28   pipeline completo"
+echo '  flow "tabla_x de julio a diciembre 2025, despues tabla_y todo 2024"   varias, en texto'
+echo "  flow --cola                                    retoma la ultima cola"

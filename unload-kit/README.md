@@ -1,4 +1,4 @@
-# unload kit v9.3  (flow 2.3 · unload 5.1 · generador modo estricto)
+# unload kit v9.4  (flow 2.4 · unload 5.2 · generador modo estricto)
 
 Backfill desde Redshift (cuenta 595738433757) hacia tablas raw existentes
 (cuenta 608614369971). El esquema lo dicta la TABLA DESTINO.
@@ -28,6 +28,42 @@ JSON sincronizados, o el proximo deploy de CI/CD lo pisa.
 
 Con el generador viejo desplegado, flow NO publica JSON sincronizados (lo
 revisa antes de subir), y si igual algo se colara, revierte la publicacion.
+
+## Varias tablas, en texto libre
+
+    flow "vamos con tran_item del 4 de julio 2025 a fin de año y despues
+          fact_x de enero a marzo 2026"
+    flow --pegar          pegas el pedido (varias lineas) y terminas con Ctrl-D
+    flow --cola           retoma la ultima cola donde quedo
+
+1. Hace login SSO si hace falta (lo que hacian inic / inht).
+2. Interpreta el pedido: con Claude Code (claude -p) si esta instalado; si
+   no, con un parser local de fechas en castellano ("del 1 al 10 de octubre",
+   "julio a diciembre 2025", "todo 2024", "desde marzo", "ultimos 30 dias",
+   "fin de año", 04/07/2025, 2025-07-04...). Si los dos lo entienden
+   distinto, te avisa.
+3. Resuelve cada tabla: JSON de backfill existente (nombre, parte del nombre
+   o numero del listado) o, si no hay, la tabla destino en el Glue Catalog.
+4. Muestra el plan con fechas explicitas y pregunta dos cosas: si puede
+   reemplazar particiones que ya existan en destino, y si ejecuta.
+5. Corre las tablas una tras otra sin preguntar nada mas. Si una falla, sigue
+   con la siguiente. Si vence el SSO, hace login y reintenta esa tabla. Si
+   se cae la VPN, pausa: `flow --cola` sigue desde ahi.
+6. Resumen final, JSON nuevos para commitear y log en logs/.
+
+Sin comillas, zsh puede interpretar caracteres como ? * ( ): usalas.
+Variables: FLOW_INTERPRETE=auto|claude|local, FLOW_CLAUDE_MODEL,
+FLOW_LOGIN_CMD (ej. 'zsh -ic "inic && inht"').
+
+## Tablas sin JSON
+
+`flow esquema.tabla --desde ... --hasta ...` (o nombrarla en un pedido)
+genera el JSON desde la tabla destino del Glue Catalog: columnas, tipos,
+particion y auditoria. No hace falta Redshift. Con FLOW_RS_PASS ademas
+lee Redshift y manda NULL en las columnas que el origen no tenga; sin eso,
+si falta alguna el UNLOAD falla y no se mueve nada. Si ya hay un
+{tabla}.json de otro loader (el FCSM normal), el nuevo va a
+{tabla}_backfill.json. Commitea los JSON nuevos en el repo.
 
 ## Alcance
 
@@ -75,6 +111,12 @@ Una particion del landing se mueve sin volver a correr el UNLOAD solo si:
 Lo que no pasa, se vuelve a bajar, y flow muestra el motivo de cada una.
 Con --solo-mover y sin VPN no se puede consultar MWAA: valida solo fecha y
 esquema, y lo avisa.
+
+## Preguntas en modo automatico
+
+--auto contesta si a lo seguro; --auto-borrar tambien a los reemplazos.
+"Seguir igual pese al problema?" (el analisis no calza, el JSON no calza,
+tabla sin destino) en modo automatico es siempre NO: esa tabla se corta.
 
 ## Si se corta (SSO, red, disco, Ctrl-C)
 

@@ -22,7 +22,16 @@ Pasos:
      disco) y registra. Si se corta, re-correr el mismo comando sigue donde quedo
   6. Verifica y limpia
 
-Tabla nueva (schema.tabla sin JSON): antes genera el JSON desde Redshift.
+Tabla nueva (sin JSON): lo genera desde la tabla destino del Glue Catalog y
+lo publica (Redshift solo si hay FLOW_RS_PASS, para validar columnas).
+
+Varias tablas, en texto libre (una tras otra, sin preguntas en el medio):
+    flow "tran_item del 4 de julio 2025 a fin de año, despues fact_x de enero a marzo 2026"
+    flow --pegar                              pegas el pedido (termina con Ctrl-D)
+    flow --cola                               retoma la ultima cola (VPN, SSO, Ctrl-C)
+  Lo interpreta Claude Code (claude -p) si esta instalado, si no un parser
+  local; muestra el plan con fechas explicitas y pide confirmacion.
+  Si una sesion SSO vence, hace el login solo (FLOW_LOGIN_CMD para cambiarlo).
 
 Uso:
     flow 7 --desde 2025-01-01 --hasta 2025-12-31
@@ -44,18 +53,21 @@ Requiere unload.py en el mismo directorio, boto3 + requests (como mwaa_cert)
 y psycopg2 solo si genera o valida contra Redshift (FLOW_RS_PASS).
 """
 
-__version__ = "2.3"
+__version__ = "2.4"
 
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 from collections import Counter
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import unload as U  # noqa: E402
+import pedido as P  # noqa: E402
 
 C = U.C
 
@@ -125,11 +137,16 @@ class MwaaNoDisponible(Exception):
     """MWAA no responde (tipicamente: VPN caida) o no se pudo autenticar."""
 
 
+PASO_ACTUAL = ""      # ultimo paso de run_flow (para el resumen de la cola)
+
+
 class Pasos:
     def __init__(self, plan):
         self.plan, self.i = plan, 0
 
     def __call__(self, label):
+        global PASO_ACTUAL
+        PASO_ACTUAL = label
         self.i += 1
         print()
         print(f"{C.B}━━ [{self.i}/{len(self.plan)}] {label} {C.END}")
@@ -405,12 +422,108 @@ def respaldar(path):
     return dst
 
 
-def escribir_loader_json(schema, table, column_dt, columns, conn_id):
-    """JSON inicial del loader (backfill) a partir de las columnas de Redshift."""
+def ruta_json_nuevo(schema, table):
+    """Donde va el JSON de backfill de una tabla nueva.
+
+    {table}.json, salvo que ese nombre ya lo use otro loader (tipicamente el
+    FCSM normal de la misma tabla, que ing.py guarda asi): ahi va
+    {table}_backfill.json, para no pisarlo.
+    """
     path = LOADERS_PATH / f"{table}.json"
     if path.exists():
+        try:
+            d = json.loads(path.read_text())
+        except ValueError:
+            d = {}
+        if not (d.get("schema") == schema and d.get("table") == table
+                and d.get("only_unload") is True):
+            path = LOADERS_PATH / f"{table}_backfill.json"
+    return path
+
+
+def json_desde_destino(schema, table, glue_tbl, fuente, conn_id):
+    """JSON de backfill armado desde el Glue Catalog de la tabla destino.
+
+    fuente: columnas del origen (Redshift) si se pudieron leer; sin ellas se
+    asume que el origen tiene todas las columnas del destino (salvo las de
+    auditoria, que se calculan). Si alguna falta, el UNLOAD falla con
+    "column ... does not exist" y no se mueve nada.
+    """
+    sd = glue_tbl["StorageDescriptor"]
+    cols = [c["Name"] for c in sd.get("Columns", [])]
+    pks = [p["Name"] for p in (glue_tbl.get("PartitionKeys") or [])]
+    if fuente is None:
+        fuente = (set(cols) - set(AUDIT_EXPRS)) | set(pks)
+        U.warn("Sin acceso a Redshift (FLOW_RS_PASS): asumo que el origen tiene las")
+        U.warn("columnas del destino. Si falta alguna, el UNLOAD falla y no se mueve nada.")
+    mapping, col_dt, acciones, errores = sincronizar({"columns_mapping": {}}, glue_tbl, fuente)
+    if errores:
+        for e in errores:
+            U.bad(e)
+        return None
+    nulas = [a[1] for a in acciones if a[0] == "sin_origen"]
+    if nulas:
+        U.warn(f"{len(nulas)} columnas del destino no estan en el origen: iran con NULL "
+               f"({', '.join(nulas[:5])}{'...' if len(nulas) > 5 else ''})")
+    path = ruta_json_nuevo(schema, table)
+    if path.exists():
+        respaldar(path)
+    escribir_json(path, {
+        "schema": schema, "table": table, "redshift_conn_id": conn_id,
+        "only_unload": True, "column_dt": col_dt,
+        "schema_source": f"glue:{U.GLUE_DB}.{glue_tbl.get('Name') or U.GLUE_TABLE_TPL.format(schema=schema, table=table)}",
+        "schema_synced_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "columns_mapping": mapping,
+    })
+    U.ok(f"JSON generado desde el destino: {path.name}  "
+         f"({len(mapping) - 1} columnas + particion '{col_dt}')")
+    U.info(f"{path}")
+    return path
+
+
+def generar_json(cfg, prep):
+    """Crea el JSON de una tabla que no lo tiene. Devuelve (ok, columnas_origen).
+
+    Con tabla destino en el Catalog, el JSON sale de ahi (no hace falta
+    Redshift). Redshift se usa solo si hay FLOW_RS_PASS (para detectar
+    columnas que el origen no tiene), o si no hay tabla destino.
+    """
+    schema, table = cfg["schema"], cfg["table"]
+    conn_id = prep.get("conn_id") or CONN_POR_ESQUEMA.get(schema, CONN_DEFAULT)
+    print(f"  redshift_conn_id: {conn_id}")
+    g = U.aws(["glue", "get-table", "--database-name", U.GLUE_DB,
+               "--name", cfg["_glue_table"]], U.PROFILE_DST, check=False)
+    columns = fuente = None
+    if g is None or os.environ.get("FLOW_RS_PASS"):
+        try:
+            columns = rs_columns(schema, prep["table_real"])
+            fuente = {c for c, _ in columns}
+            print(f"  {len(columns)} columnas leidas de Redshift ({schema}.{prep['table_real']})")
+        except Exception as e:  # noqa: BLE001
+            if g is None:
+                U.bad(f"No pude leer Redshift: {e}")
+                return False, None
+            U.warn(f"No pude leer Redshift ({e}): se arma solo con el destino.")
+    if g is None:
+        U.warn(f"{U.GLUE_DB}.{cfg['_glue_table']} no existe: el JSON sale solo de Redshift.")
+        column_dt = elegir_column_dt(columns, prep.get("column_dt"))
+        path, _ = escribir_loader_json(schema, table, column_dt, columns, conn_id)
+    else:
+        print(f"  Destino: {U.GLUE_DB}.{cfg['_glue_table']}")
+        path = json_desde_destino(schema, table, g["Table"], fuente, conn_id)
+        if path is None:
+            return False, None
+    cfg.update(json.loads(path.read_text()))
+    cfg["_file"] = path
+    return True, fuente
+
+
+def escribir_loader_json(schema, table, column_dt, columns, conn_id):
+    """JSON inicial del loader (backfill) a partir de las columnas de Redshift."""
+    path = ruta_json_nuevo(schema, table)
+    if path.exists():
         U.warn(f"Ya existe {path.name}")
-        if not U.confirm("Sobreescribir? [y/N]", destructivo=True):
+        if not U.confirm("Sobreescribir? [y/N]", riesgo=True):
             U.info("Se usa el JSON existente.")
             return path, False
         respaldar(path)
@@ -977,9 +1090,13 @@ def _esquemas_que_no_calzan(cfg, glue_tbl, enc):
 
 
 def runs_del_dag(s, host, dag_id, desde):
-    """[(inicio, fin, estado, run_id)] de los runs que empezaron despues de 'desde'."""
+    """[(inicio, fin, estado, run_id)] de los runs creados despues de 'desde'.
+
+    Filtra por execution_date (y no start_date) para incluir los que estan en
+    cola, que todavia no tienen start_date.
+    """
     q = (f"dags/{dag_id}/dagRuns?limit=100"
-         f"&start_date_gte={desde.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%S}Z")
+         f"&execution_date_gte={desde.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%S}Z")
     d = api(s, host, "GET", q, silencioso=True)
     if not isinstance(d, dict):
         return None
@@ -1133,7 +1250,22 @@ def tramos_a_bajar(fechas):
     return [(min(fechas), max(fechas))]
 
 
+def esperar_run_en_curso(cfg, s, host, dag_id, sel):
+    """Si el DAG ya tiene un run corriendo o en cola, lo espera en vez de
+    disparar otro (ej.: retomar una cola despues de un corte de VPN).
+    False si ese run termina mal."""
+    runs = runs_del_dag(s, host, dag_id, datetime.now(timezone.utc) - timedelta(days=3)) or []
+    activos = [r for r in runs if r[2] in ("running", "queued")]
+    if not activos:
+        return True
+    rid = activos[-1][3]
+    U.warn(f"El DAG ya tiene un run en curso ({rid}): lo espero en vez de disparar otro.")
+    return esperar_unload(cfg, s, host, dag_id, rid, None, sel) is not None
+
+
 def run_flow(cfg, o):
+    global PASO_ACTUAL
+    PASO_ACTUAL = ""
     schema, table = cfg["schema"], cfg["table"]
     dag_id = DAG_ID_TPL.format(schema=schema, table=table)
     sel = cfg.get("_sel", table)
@@ -1198,24 +1330,10 @@ def run_flow(cfg, o):
         # ── generar JSON (tabla nueva) ──
         fuente = None
         if "prep" in plan:
-            paso("Generando el JSON desde Redshift")
-            columns = rs_columns(schema, o["prep"]["table_real"])
-            fuente = {c for c, _ in columns}
-            print(f"  {len(columns)} columnas leidas de {schema}.{o['prep']['table_real']}")
-            g0 = U.aws(["glue", "get-table", "--database-name", U.GLUE_DB,
-                        "--name", cfg["_glue_table"]], U.PROFILE_DST, check=False)
-            pks = [p["Name"] for p in
-                   ((g0 or {}).get("Table", {}).get("PartitionKeys") or [])]
-            if len(pks) == 1 and pks[0] in fuente and not o["prep"].get("column_dt"):
-                column_dt = pks[0]
-                U.info(f"column_dt tomada del destino: {column_dt}")
-            else:
-                column_dt = elegir_column_dt(columns, o["prep"].get("column_dt"))
-            conn_id = o["prep"].get("conn_id") or CONN_POR_ESQUEMA.get(schema, CONN_DEFAULT)
-            print(f"  redshift_conn_id: {conn_id}")
-            path, _ = escribir_loader_json(schema, table, column_dt, columns, conn_id)
-            cfg.update(json.loads(path.read_text()))
-            cfg["_file"] = path
+            paso("Generando el JSON de la tabla nueva")
+            creado, fuente = generar_json(cfg, o["prep"])
+            if not creado:
+                return False
 
         g = U.aws(["glue", "get-table", "--database-name", U.GLUE_DB,
                    "--name", cfg["_glue_table"]], U.PROFILE_DST, check=False)
@@ -1228,7 +1346,7 @@ def run_flow(cfg, o):
             if glue_tbl is None:
                 U.warn(f"{U.GLUE_DB}.{cfg['_glue_table']} no existe en el Catalog.")
                 U.info("Tabla nueva: no hay esquema que replicar; el JSON queda como esta.")
-                if not U.confirm("Seguir igual? [y/N]", destructivo=True):
+                if not U.confirm("Seguir igual? [y/N]", riesgo=True):
                     return False
             else:
                 if not o["no_sync"]:
@@ -1239,7 +1357,7 @@ def run_flow(cfg, o):
                 print()
                 if not U.analyze(cfg, glue_tbl):
                     if not U.confirm("El JSON no calza con el destino. Seguir igual? [y/N]",
-                                     destructivo=True):
+                                     riesgo=True):
                         return False
 
             paso("Publicando el JSON en MWAA")
@@ -1257,6 +1375,8 @@ def run_flow(cfg, o):
         sirven = None
         if "landing" in plan:
             paso("Revisando lo que ya esta en el landing")
+            if not esperar_run_en_curso(cfg, s, host, dag_id, sel):
+                return False
             sirven, descartes, faltan = revisar_landing(cfg, glue_tbl, rango, s, host, dag_id)
             necesitan = sorted(set(faltan) | set(descartes))
             print()
@@ -1282,6 +1402,9 @@ def run_flow(cfg, o):
                 if tramo:
                     if k == 0:
                         paso("Disparando el DAG de UNLOAD")
+                        if "landing" not in plan and not esperar_run_en_curso(
+                                cfg, s, host, dag_id, sel):
+                            return False
                     else:
                         print()
                         print(f"  {C.B}Tramo {k + 1}/{len(lista)}{C.END}")
@@ -1339,6 +1462,424 @@ def run_flow(cfg, o):
     return okey
 
 
+# ─── sesiones SSO ─────────────────────────────────────────────────────────────
+
+# Lo que hacian inic / inht. Con {profile} se corre una vez por cuenta vencida;
+# para usar tus alias:  export FLOW_LOGIN_CMD='zsh -ic "inic && inht"'
+LOGIN_CMD = os.environ.get("FLOW_LOGIN_CMD", "aws sso login --profile {profile}")
+CUENTAS = ((U.PROFILE_SRC, U.ACCOUNT_SRC), (U.PROFILE_DST, U.ACCOUNT_DST))
+
+
+def sesiones_activas(perfiles=CUENTAS):
+    return all(U.check_session(p) for p, _ in perfiles)
+
+
+def asegurar_sesiones(perfiles=CUENTAS):
+    """Revisa las sesiones SSO y hace login de las vencidas."""
+    for prof, acc in perfiles:
+        if U.check_session(prof):
+            continue
+        cmd = LOGIN_CMD.replace("{profile}", prof)
+        print()
+        U.warn(f"Sesion SSO de {acc} vencida: hago login  ({cmd})")
+        U.info("Se abre el navegador: aproba el acceso y sigo solo.")
+        subprocess.run(cmd, shell=True)
+        if not U.check_session(prof):
+            U.bad(f"No quedo activa la sesion de {acc}.")
+            U.info(f"Proba a mano:  aws sso login --profile {prof}")
+            return False
+        U.ok(f"Sesion de {acc} activa.")
+    return True
+
+
+def vpn_ok():
+    try:
+        mwaa_session(timeout=8)
+        return True
+    except MwaaNoDisponible:
+        return False
+
+
+# ─── cola: varias tablas, una tras otra ──────────────────────────────────────
+
+ESTADO_DIR = Path(os.environ.get("FLOW_ESTADO_DIR", Path(__file__).resolve().parent))
+COLA_FILE = ESTADO_DIR / "cola.json"
+LOG_DIR = ESTADO_DIR / "logs"
+HECHO = ("ok", "obs")
+_TABLAS_DESTINO = None
+
+
+def tablas_destino():
+    """Nombres de las tablas del Glue Catalog destino (una sola lectura)."""
+    global _TABLAS_DESTINO
+    if _TABLAS_DESTINO is None:
+        try:
+            out = U.aws(["glue", "get-tables", "--database-name", U.GLUE_DB,
+                         "--query", "TableList[].Name"], U.PROFILE_DST)
+        except RuntimeError as e:
+            U.warn(f"No pude listar las tablas de {U.GLUE_DB}: {e}")
+            out = []
+        _TABLAS_DESTINO = [n.lower() for n in (out or [])]
+    return _TABLAS_DESTINO
+
+
+def resolver_tabla(ref, defs):
+    """(tabla, error). tabla = {schema, table, nuevo, archivo}.
+
+    Busca primero un JSON de backfill (nombre exacto, numero del listado o
+    parte del nombre); si no hay, la tabla destino en el Glue Catalog: en ese
+    caso el JSON se genera desde el destino al correrla.
+    """
+    r = ref.strip().lower().strip(".,;:")
+    bf = [d for d in defs if d.get("only_unload") is True]
+
+    def de_json(d):
+        return {"schema": d["schema"], "table": d["table"], "nuevo": False,
+                "archivo": Path(d["_file"]).name}, None
+
+    def nueva(schema, table):
+        return {"schema": schema, "table": table, "nuevo": True, "archivo": None}, None
+
+    def nombres(ds):
+        return ", ".join(f"{d['schema']}.{d['table']}" for d in ds[:5])
+
+    if r.isdigit():
+        i = int(r)
+        if not 1 <= i <= len(defs):
+            return None, f"no hay tabla #{i} (el listado tiene {len(defs)})"
+        d = defs[i - 1]
+        if d.get("only_unload") is True:
+            return de_json(d)
+        # es el loader FCSM normal: se usa (o se crea) el de backfill de esa tabla
+        t = d["table"][:-5] if d["table"].endswith("_fcsm") else d["table"]
+        r = f"{d['schema']}.{t}"
+    if "." in r:
+        schema, table = r.split(".", 1)
+        hit = [d for d in bf if d["schema"] == schema and d["table"] == table]
+        if hit:
+            return de_json(hit[0])
+        if U.GLUE_TABLE_TPL.format(schema=schema, table=table).lower() in tablas_destino():
+            return nueva(schema, table)
+        return None, (f"no hay JSON de backfill ni tabla destino "
+                      f"{U.GLUE_DB}.{U.GLUE_TABLE_TPL.format(schema=schema, table=table)}")
+    exactas = [d for d in bf if d["table"] == r]
+    if len(exactas) > 1:
+        return None, f"esta en varios esquemas: {nombres(exactas)} (usa esquema.tabla)"
+    if exactas:
+        return de_json(exactas[0])
+    parciales = [d for d in bf if r in d["table"]]
+    if len(parciales) > 1:
+        return None, f"coincide con varias: {nombres(parciales)}"
+    if parciales:
+        return de_json(parciales[0])
+    en_destino = [n for n in tablas_destino() if "__" in n]
+    cands = ([n for n in en_destino if n.split("__", 1)[1] == r]
+             or [n for n in en_destino if r in n.split("__", 1)[1]])
+    if len(cands) > 1:
+        return None, (f"no tiene JSON y en {U.GLUE_DB} coincide con varias: "
+                      f"{', '.join(cands[:5])} (usa esquema.tabla)")
+    if cands:
+        return nueva(*cands[0].split("__", 1))
+    return None, f"no hay JSON de backfill ni tabla destino que coincida en {U.GLUE_DB}"
+
+
+def interpretar(texto, defs):
+    """Items del pedido [{tabla, desde, hasta, ...}] o None. Muestra quien lo interpreto."""
+    hoy = date.today()
+    modo = os.environ.get("FLOW_INTERPRETE", "auto").lower()
+    local = err_local = None
+    if modo != "claude":
+        try:
+            local = P.interpretar_local(texto, [d["table"] for d in defs], hoy)
+        except P.PedidoInvalido as e:
+            err_local = str(e)
+    items = dudas = err_claude = None
+    if modo in ("auto", "claude"):
+        conocidas = [(i, d["schema"], d["table"], d.get("only_unload") is True)
+                     for i, d in enumerate(defs, 1)]
+        print("  Interpretando el pedido con Claude Code...", end=" ", flush=True)
+        items, dudas, err_claude = P.interpretar_claude(texto, conocidas, hoy)
+        print("listo" if items else "no disponible")
+    if items:
+        fuente = "Claude Code"
+        if local and not P.mismo_plan(local, items):
+            U.warn("Ojo: el parser local lo entendio distinto:")
+            for it in local:
+                U.info(f"{it['tabla']}  {it['desde']} .. {it['hasta']}")
+        elif local:
+            fuente += " (el parser local coincide)"
+    elif local:
+        fuente, items = "parser local", local
+        if err_claude and modo != "local":
+            U.info(f"Claude Code: {err_claude}")
+    else:
+        U.bad("No pude interpretar el pedido.")
+        if err_local:
+            U.info(err_local)
+        if err_claude:
+            U.info(f"Claude Code: {err_claude}")
+        U.info('Ej:  flow "fact_x del 4 de julio 2025 a fin de año y despues '
+               'fact_y de enero a marzo 2026"')
+        return None
+    for d in dudas or []:
+        U.warn(f"Claude Code: {d}")
+    U.info(f"Interpretado por: {fuente}")
+    return items
+
+
+def mostrar_plan(items):
+    U.title(f"Plan: {len(items)} tabla{'s' if len(items) != 1 else ''}")
+    w = max(len(f"{i['schema']}.{i['table']}") for i in items)
+    for k, it in enumerate(items, 1):
+        sel = f"{it['schema']}.{it['table']}"
+        dias = (date.fromisoformat(it["hasta"]) - date.fromisoformat(it["desde"])).days + 1
+        hecho = f"  {C.OK}(ya hecha){C.END}" if it.get("estado") in HECHO else ""
+        print(f"  {C.B}{k}.{C.END} {sel:<{w}}  {it['desde']} .. {it['hasta']}  "
+              f"{C.DIM}{dias} dias{C.END}{hecho}")
+        if it.get("nuevo"):
+            U.info("sin JSON: se genera desde la tabla destino y se publica")
+        if it.get("forzar_unload"):
+            U.info("forzar unload: baja todo de Redshift aunque este en el landing")
+        if it.get("solo_mover"):
+            U.info("solo mover lo que ya esta en el landing (sin UNLOAD)")
+        if it.get("nota"):
+            U.info(it["nota"])
+
+
+def _si(prompt):
+    try:
+        return input(f"  {prompt} ").strip().lower() in ("y", "s", "si", "yes")
+    except EOFError:
+        print()
+        return False
+
+
+def leer_cola():
+    try:
+        return json.loads(COLA_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def guardar_cola(cola):
+    tmp = COLA_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cola, ensure_ascii=False, indent=2))
+    tmp.replace(COLA_FILE)
+
+
+def _ahora():
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+class _Tee:
+    """Copia lo que se imprime a un log (sin colores)."""
+    ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+    def __init__(self, consola, archivo):
+        self.c, self.f = consola, archivo
+
+    def write(self, s):
+        self.c.write(s)
+        self.f.write(self.ANSI.sub("", s))
+        return len(s)
+
+    def flush(self):
+        self.c.flush()
+        self.f.flush()
+
+    def isatty(self):
+        return self.c.isatty()
+
+
+def cmd_cola(texto):
+    """flow "pedido en texto"  |  flow --cola (retoma la ultima)."""
+    if texto is not None:
+        U.title("Pedido")
+        for linea in texto.strip().splitlines():
+            print(f"  {C.DIM}{linea}{C.END}")
+    if not asegurar_sesiones():
+        return False
+    defs = U.load_defs()
+
+    if texto is not None:
+        print()
+        items = interpretar(texto, defs)
+        if not items:
+            return False
+        plan, errores = [], []
+        for it in items:
+            t, err = resolver_tabla(it["tabla"], defs)
+            if err:
+                errores.append(f'"{it["tabla"]}": {err}')
+                continue
+            plan.append({**t, "desde": it["desde"], "hasta": it["hasta"],
+                         "nota": it.get("nota", ""), "estado": "pendiente",
+                         "forzar_unload": bool(it.get("forzar_unload")),
+                         "solo_mover": bool(it.get("solo_mover"))})
+        if errores:
+            print()
+            for e in errores:
+                U.bad(e)
+            U.info("Corregi el pedido (nombre exacto o esquema.tabla) y volve a correrlo.")
+            return False
+        cola = {"pedido": texto.strip(), "creada": _ahora(), "items": plan}
+    else:
+        cola = leer_cola()
+        if not cola:
+            U.bad(f"No hay una cola guardada para retomar ({COLA_FILE}).")
+            return False
+        U.info(f"Cola del {cola['creada']}: {cola['pedido'][:100]}")
+        if all(i["estado"] in HECHO for i in cola["items"]):
+            mostrar_plan(cola["items"])
+            print()
+            U.ok("Esa cola ya termino.")
+            return True
+
+    mostrar_plan(cola["items"])
+    print()
+    print("  Conectando con MWAA...", end=" ", flush=True)
+    try:
+        mwaa_session(timeout=10)
+        print("OK")
+    except MwaaNoDisponible as e:
+        print()
+        U.bad(str(e))
+        U.info("Conecta la VPN y volve a correr el mismo comando.")
+        return False
+
+    print()
+    if not U.AUTO_BORRAR:
+        U.AUTO_BORRAR = _si("Si una particion ya existe en destino con otros datos, "
+                            "la reemplazo? [y/N]")
+        if not U.AUTO_BORRAR:
+            U.info("Las tablas que necesiten reemplazar se cortan sin tocar el destino.")
+    if not _si("Ejecutar la cola? [y/N]"):
+        print("  Cancelado.")
+        return False
+    U.AUTO = U.NO_INTERACTIVO = True
+    guardar_cola(cola)
+    return run_cola(cola)
+
+
+def _correr_item(it):
+    """Corre una tabla de la cola: "ok" | "obs" | "fallo" | "sin_vpn"."""
+    sel = f"{it['schema']}.{it['table']}"
+    for intento in (1, 2):
+        if not asegurar_sesiones():
+            return "fallo"
+        defs = U.load_defs()          # recarga: toma los JSON recien creados
+        hit = [d for d in defs if d["schema"] == it["schema"]
+               and d["table"] == it["table"] and d.get("only_unload") is True]
+        prep = None
+        if hit:
+            cfg = hit[0]
+        else:
+            cfg = {"schema": it["schema"], "table": it["table"], "columns_mapping": {},
+                   "only_unload": True, "_file": ruta_json_nuevo(it["schema"], it["table"])}
+            prep = {"table_real": it["table"], "conn_id": None, "column_dt": None}
+        cfg["_sel"] = sel
+        cfg["_glue_table"] = U.GLUE_TABLE_TPL.format(schema=cfg["schema"], table=cfg["table"])
+        o = {"desde": it["desde"], "hasta": it["hasta"], "run_id": None,
+             "solo_dag": False, "solo_mover": bool(it.get("solo_mover")),
+             "solo_sync": False, "solo_json": False, "no_sync": False, "prep": prep,
+             "forzar_unload": bool(it.get("forzar_unload"))}
+        U.SOLO_PARTS, U.SOLO_PARTS_RANGO = None, False
+        del U.ERRORES[:]
+        try:
+            ok = run_flow(cfg, o)
+        except MwaaNoDisponible as e:
+            U.bad(str(e))
+            return "sin_vpn"
+        except RuntimeError as e:
+            U.bad(str(e))
+            ok = False
+        if prep and Path(cfg["_file"]).exists():
+            it["json_nuevo"] = str(cfg["_file"])
+        if ok:
+            return "ok"
+        if PASO_ACTUAL == "Verificacion final":
+            return "obs"
+        if not sesiones_activas():
+            if intento == 1:
+                U.warn("La sesion SSO vencio en el medio: login y reintento la tabla "
+                       "(sigue donde quedo).")
+                continue
+            return "fallo"
+        if not vpn_ok():
+            return "sin_vpn"
+        return "fallo"
+    return "fallo"
+
+
+def run_cola(cola):
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log = LOG_DIR / f"cola-{datetime.now():%Y%m%d-%H%M%S}.log"
+    fh = open(log, "a", encoding="utf-8")
+    consola, sys.stdout = sys.stdout, _Tee(sys.stdout, fh)
+    cola.setdefault("logs", []).append(str(log))
+    items, t0 = cola["items"], time.time()
+    try:
+        for k, it in enumerate(items, 1):
+            if it["estado"] in HECHO:
+                continue
+            print()
+            print(f"{C.B}{'═' * 64}{C.END}")
+            print(f"{C.B}  Tabla {k}/{len(items)}: {it['schema']}.{it['table']}   "
+                  f"{it['desde']} .. {it['hasta']}{C.END}")
+            print(f"{C.B}{'═' * 64}{C.END}")
+            it.update(estado="en curso", inicio=_ahora(), detalle="")
+            guardar_cola(cola)
+            t = time.time()
+            res = _correr_item(it)
+            it["duracion"] = U.dur(time.time() - t)
+            if res == "sin_vpn":
+                it["estado"] = "pendiente"
+                guardar_cola(cola)
+                print()
+                U.bad("Sin conexion con MWAA: la cola queda pausada en esta tabla.")
+                U.info("Cuando vuelva la VPN:  flow --cola")
+                break
+            it["estado"] = res
+            if res == "fallo":
+                it["detalle"] = (U.ERRORES[0] if U.ERRORES else f"en: {PASO_ACTUAL}")[:140]
+            elif res == "obs" and U.ERRORES:
+                it["detalle"] = U.ERRORES[-1][:140]
+            guardar_cola(cola)
+    finally:
+        resumen_cola(cola, t0)
+        guardar_cola(cola)
+        sys.stdout = consola
+        fh.close()
+    return all(i["estado"] in HECHO for i in items)
+
+
+def resumen_cola(cola, t0):
+    items = cola["items"]
+    U.title(f"Resumen de la cola  ({len(items)} tablas, {U.dur(time.time() - t0)})")
+    icono = {"ok": f"{C.OK}✓{C.END}", "obs": f"{C.WARN}!{C.END}", "fallo": f"{C.ERR}✗{C.END}"}
+    texto = {"ok": "completa", "obs": "movida; la verificacion dejo observaciones",
+             "fallo": "fallo", "pendiente": "pendiente", "en curso": "interrumpida"}
+    w = max(len(f"{i['schema']}.{i['table']}") for i in items)
+    for it in items:
+        e = it["estado"]
+        print(f"  {icono.get(e, '·')} {it['schema'] + '.' + it['table']:<{w}}  "
+              f"{it['desde']} .. {it['hasta']}  {texto.get(e, e)}  "
+              f"{C.DIM}{it.get('duracion', '')}{C.END}")
+        if it.get("detalle") and e in ("fallo", "obs"):
+            U.info(it["detalle"])
+    if any(i["estado"] not in HECHO for i in items):
+        print()
+        U.info("Para seguir con lo que falta:  flow --cola")
+    nuevos = [i["json_nuevo"] for i in items if i.get("json_nuevo")]
+    if nuevos:
+        print()
+        U.warn("JSON nuevos: commitealos en el repo (si no, el proximo deploy de CI/CD no los tiene):")
+        for n in nuevos:
+            U.info(n)
+    if cola.get("logs"):
+        U.info(f"Log: {cola['logs'][-1]}")
+
+
 # ─── main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1375,11 +1916,27 @@ def main():
     print(f"{C.DIM}flow v{__version__} (unload v{U.__version__}){C.END}")
 
     if "--desplegar-generador" in flags:
-        if not U.check_session(MWAA_PROFILE):
-            U.bad(f"Sesion SSO no activa para {U.ACCOUNT_SRC}")
-            U.info(f"aws sso login --profile {MWAA_PROFILE}")
+        if not asegurar_sesiones(((MWAA_PROFILE, U.ACCOUNT_SRC),)):
             sys.exit(1)
         sys.exit(0 if cmd_desplegar_generador() else 1)
+
+    # pedido en texto libre -> cola:  flow "tabla x de julio a diciembre 2025, despues y ..."
+    texto = None
+    if "--pegar" in flags:
+        print("  Pega el pedido y termina con Ctrl-D en una linea vacia:")
+        texto = sys.stdin.read()
+        if not sys.stdin.isatty():
+            try:
+                sys.stdin = open("/dev/tty")      # para poder confirmar despues
+            except OSError:
+                pass
+    elif len(pos) > 1 or (pos and re.search(r"\s", pos[0])):
+        texto = " ".join(pos)
+    if texto is not None or "--cola" in flags:
+        if texto is not None and not texto.strip():
+            U.bad("El pedido esta vacio.")
+            sys.exit(1)
+        sys.exit(0 if cmd_cola(texto) else 1)
 
     defs = U.load_defs()
     if not defs:
@@ -1419,11 +1976,8 @@ def main():
                 U.bad(f"--{f} invalida: '{o[f]}' (formato AAAA-MM-DD)")
                 sys.exit(1)
 
-    for prof, acc in ((U.PROFILE_SRC, U.ACCOUNT_SRC), (U.PROFILE_DST, U.ACCOUNT_DST)):
-        if not U.check_session(prof):
-            U.bad(f"Sesion SSO no activa para {acc}")
-            U.info(f"aws sso login --profile {prof}")
-            sys.exit(1)
+    if not asegurar_sesiones():
+        sys.exit(1)
 
     sys.exit(0 if run_flow(cfg, o) else 1)
 
@@ -1441,6 +1995,7 @@ if __name__ == "__main__":
         print("  - Si estaba esperando el DAG, sigue en MWAA:  flow <tabla> --run <run_id>")
         print("  - Si estaba moviendo: lo movido ya quedo registrado; volve a correr el")
         print("    mismo comando y sigue donde quedo.")
+        print("  - Si era una cola:  flow --cola  la retoma desde esa tabla.")
         sys.exit(130)
     except RuntimeError as e:
         U.bad(str(e))
