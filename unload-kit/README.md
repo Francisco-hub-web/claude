@@ -1,4 +1,4 @@
-# unload kit v9.5  (flow 2.5 · unload 5.2 · generador con dias sueltos)
+# unload kit v9.5.1  (flow 2.5.1 · unload 5.2 · generador con dias sueltos)
 
 Backfill desde Redshift (cuenta 595738433757) hacia tablas raw existentes
 (cuenta 608614369971). El esquema lo dicta la TABLA DESTINO.
@@ -55,7 +55,10 @@ revisa antes de subir), y si igual algo se colara, revierte la publicacion.
    se cae la VPN, pausa: `flow --cola` sigue desde ahi.
 6. Resumen final, JSON nuevos para commitear y log en logs/.
 
-Sin comillas, zsh puede interpretar caracteres como ? * ( ): usalas.
+Texto pegado de otro lado (markdown, varias lineas, `backticks`): usa
+flow --pegar (pegas, Enter y Ctrl-D). Entre comillas dobles zsh ejecuta lo
+que esta entre `backticks` y expande $...: las fechas desaparecen ("command
+not found") y flow corta avisando. Comillas simples tambien sirven.
 Variables: FLOW_INTERPRETE=auto|claude|local, FLOW_CLAUDE_MODEL,
 FLOW_LOGIN_CMD (ej. 'zsh -ic "inic && inht"').
 

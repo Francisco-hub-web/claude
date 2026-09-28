@@ -58,7 +58,7 @@ Requiere unload.py en el mismo directorio, boto3 + requests (como mwaa_cert)
 y psycopg2 solo si genera o valida contra Redshift (FLOW_RS_PASS).
 """
 
-__version__ = "2.5"
+__version__ = "2.5.1"
 
 import json
 import os
@@ -1717,7 +1717,8 @@ def interpretar(texto, defs):
                      for i, d in enumerate(defs, 1)]
         print("  Interpretando el pedido con Claude Code...", end=" ", flush=True)
         items, dudas, err_claude = P.interpretar_claude(texto, conocidas, hoy)
-        print("listo" if items else "no disponible")
+        print("listo" if items else
+              "respondio, sin cargas" if "ninguna carga" in (err_claude or "") else "no disponible")
     if items and local and len(local) == len(items):
         # Claude convirtio en rango una lista de dias que el parser local leyo
         # exacta: se usa la lista (nunca se baja mas de lo pedido).
@@ -1831,6 +1832,16 @@ def cmd_cola(texto):
         U.title("Pedido")
         for linea in texto.strip().splitlines():
             print(f"  {C.DIM}{linea}{C.END}")
+        # Entre comillas dobles, zsh ejecuta lo que esta entre `backticks` (y
+        # expande $...): las fechas desaparecen y quedan lineas de solo comas.
+        if re.search(r"^[ \t]*,[ \t]*,[ \t,;]*$", texto, re.M):
+            print()
+            U.bad("Al pedido le faltan partes: hay lineas con solo comas.")
+            U.info("La shell borro lo que estaba entre `backticks` (zsh los ejecuta como")
+            U.info("comandos: por eso el 'command not found'). Pegalo sin que pase por la shell:")
+            U.info("  flow --pegar      pegas el texto, Enter y Ctrl-D")
+            U.info("o usa comillas simples:  flow '...'")
+            return False
     if not asegurar_sesiones():
         return False
     defs = U.load_defs()
