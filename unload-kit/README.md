@@ -1,4 +1,4 @@
-# unload kit v9.4  (flow 2.4 · unload 5.2 · generador modo estricto)
+# unload kit v9.5  (flow 2.5 · unload 5.2 · generador con dias sueltos)
 
 Backfill desde Redshift (cuenta 595738433757) hacia tablas raw existentes
 (cuenta 608614369971). El esquema lo dicta la TABLA DESTINO.
@@ -9,10 +9,14 @@ Backfill desde Redshift (cuenta 595738433757) hacia tablas raw existentes
 
 Queda en ~/lakehousev2/unload-kit (otra ruta: UNLOAD_HOME=/ruta ./install.sh).
 
-## PRIMERO: desplegar el generador (una sola vez)
+## PRIMERO: desplegar el generador (una vez por version del kit)
 
 flow deja los JSON en "modo estricto" (cada columna se castea al tipo del
-destino). Eso lo entiende SOLO el generador nuevo (generator/ del kit).
+destino) y puede pedir dias sueltos (param "load_dates"). Eso lo entiende
+SOLO el generador del kit (generator/). v9.5 agrega load_dates: si ya
+desplegaste el de v9.2-9.4, desplegalo de nuevo. La linea del WHERE que
+cambia aparece como "reemplazada (esperado)"; cualquier otra que aparezca es
+una personalizacion tuya: no confirmes.
 
     inic
     flow --desplegar-generador
@@ -54,6 +58,33 @@ revisa antes de subir), y si igual algo se colara, revierte la publicacion.
 Sin comillas, zsh puede interpretar caracteres como ? * ( ): usalas.
 Variables: FLOW_INTERPRETE=auto|claude|local, FLOW_CLAUDE_MODEL,
 FLOW_LOGIN_CMD (ej. 'zsh -ic "inic && inht"').
+
+## Dias especificos
+
+    flow "quiero estos dias
+          **chi_easy_dim_vw__fact_daily_inventory_tran_item** — 3 días:
+          2025-01-05, 2025-01-17, 2025-02-19
+          **chi_easy_dim_vw__fact_daily_mgt_sys_sales** — 5 días:
+          2025-03-07, 2025-05-01 → 2025-05-03, 2025-07-11"
+
+    flow 7 --particion 2025-01-05,2025-05-01..2025-05-03       una tabla, por CLI
+
+Fechas separadas por coma, "y" o salto de linea son dias sueltos; unidas por
+"a", "al", "hasta", "→" o ".." son un rango. Si el pedido dice "N días", flow
+controla que coincida. Las tablas se pueden nombrar como esquema__tabla.
+
+Por tabla hace UN solo UNLOAD con exactamente esos dias (conf "load_dates":
+WHERE column_dt IN (...)), reutilizando los que ya esten validos en el
+landing, y mueve SOLO esos dias. Los dias sin datos en el origen quedan en el
+resumen.
+
+Necesita el generador v9.5 desplegado (una vez):  flow --desplegar-generador
+flow le pregunta a MWAA si el DAG ya acepta load_dates; si todavia no (o MWAA
+no re-parseo), hace un UNLOAD por tramo continuo: mas lento, mismo resultado.
+Si un UNLOAD escribe dias que no se pidieron, avisa y no los mueve.
+
+Tambien aplica a los rangos: si al rango le faltan dias salteados en el
+landing, se bajan todos en un solo UNLOAD con la lista exacta.
 
 ## Tablas sin JSON
 

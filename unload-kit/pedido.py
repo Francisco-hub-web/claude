@@ -9,6 +9,14 @@ pedido - convierte un pedido en texto libre en una cola de cargas para flow.
     ->  tran_item  2025-07-04 .. 2025-12-31
         fact_x     2026-01-01 .. 2026-03-31
 
+    flow "chi_easy_dim_vw__fact_y — 5 días: 2025-03-07, 2025-05-01 → 2025-05-03, 2025-07-11"
+
+    ->  fact_y     5 dias: 2025-03-07, 2025-05-01, 2025-05-02, 2025-05-03, 2025-07-11
+
+Rango o lista: fechas unidas por "a", "al", "hasta", "→", "..", "-" (o "entre X
+y Y") forman un rango; separadas por coma, "y" o salto de linea, una lista de
+dias sueltos (cada elemento puede ser un dia, un sub-rango o un mes entero).
+
 Dos interpretes:
   - Claude Code (claude -p), si esta instalado: entiende cualquier redaccion.
   - Local (reglas de fechas en castellano): sin red e instantaneo. Es el
@@ -45,8 +53,11 @@ PATRONES = [
     ("iso", r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b"),
     ("dmy", r"\b(\d{1,2})[/.-](\d{1,2})[/.-](\d{4}|\d{2})\b"),
     ("ultimos", r"\bultim[oa]s?\s+(\d{1,4})\s+dias\b"),
-    # "del 1 al 10 de octubre", "entre el 5 y el 8 de julio 2025"
-    ("dias", rf"\b(\d{{1,2}})\s*(?:al|a|-|y|hasta)\s*(?:el\s+)?(\d{{1,2}})(?:\s+de)?\s+({_MES})\b(?:{_ANIO})?"),
+    # rango de dias del mismo mes: "del 1 al 10 de octubre", "entre el 5 y el 8 de julio 2025"
+    ("dias", rf"\b(\d{{1,2}})\s*(?:al|a|-|hasta)\s*(?:el\s+)?(\d{{1,2}})(?:\s+de)?\s+({_MES})\b(?:{_ANIO})?"),
+    ("dias", rf"\bentre\s+(?:el\s+)?(\d{{1,2}})\s+y\s+(?:el\s+)?(\d{{1,2}})(?:\s+de)?\s+({_MES})\b(?:{_ANIO})?"),
+    # dias sueltos del mismo mes: "5, 17 y 28 de enero 2025"
+    ("dias_lista", rf"\b(\d{{1,2}}(?:\s*(?:,|\by\b|\be\b)\s*(?:el\s+)?\d{{1,2}})+)(?:\s+de)?\s+({_MES})\b(?:{_ANIO})?"),
     ("fin_mes", rf"\bfin(?:es|al)?\s+de\s+({_MES})\b(?:{_ANIO})?"),
     ("dia", rf"\b(\d{{1,2}}|primero|1ro|1ero)(?:\s+de)?\s+({_MES})\b(?:{_ANIO})?"),
     ("fin_anio", rf"\bfin(?:es|al)?\s+(?:de|del)\s+{_REF_ANIO}(?:\s+(\d{{4}}))?"),
@@ -87,7 +98,8 @@ def _refs(t, conocidas):
         out.append((m.start(), m.end(), m.group(1)))
     for m in re.finditer(r"(?<![\w-])#(\d{1,3})\b", t):
         out.append((m.start(), m.end(), m.group(1)))
-    ident = r"(?<![\w.-])([a-z][a-z0-9]*(?:_[a-z0-9]+)+(?:\.[a-z][a-z0-9_]*)?|[a-z][a-z0-9_]*\.[a-z][a-z0-9_]+)(?![\w-])"
+    # fact_x, esquema.tabla y el nombre de Glue esquema__tabla
+    ident = r"(?<![\w.-])([a-z][a-z0-9]*(?:_+[a-z0-9]+)+(?:\.[a-z][a-z0-9_]*)?|[a-z][a-z0-9_]*\.[a-z][a-z0-9_]+)(?![\w-])"
     for m in re.finditer(ident, t):
         out.append((m.start(), m.end(), m.group(1).strip(".")))
     simples = {c for c in conocidas if "_" not in c}
@@ -115,13 +127,56 @@ def _menciones(seg):
     for ini, _, _, end, tipo, g in cands:
         if ini < fin:
             continue
-        if tipo == "dias":         # dos dias del mismo mes
-            out.append(_mencion("dia", (g[0], g[2], g[3]), seg[ini:end]))
-            out.append(_mencion("dia", (g[1], g[2], g[3]), seg[ini:end]))
+        txt = seg[ini:end]
+        if tipo == "dias":          # rango: el segundo dia cierra al primero
+            nuevas = [_mencion("dia", (g[0], g[2], g[3]), txt),
+                      _mencion("dia", (g[1], g[2], g[3]), txt)]
+            nuevas[1]["par"] = True
+        elif tipo == "dias_lista":  # sueltos: cada uno es su propio dia
+            nuevas = [_mencion("dia", (n, g[1], g[2]), txt) for n in re.findall(r"\d{1,2}", g[0])]
+            for m in nuevas[1:]:
+                m["suelta"] = True
         else:
-            out.append(_mencion(tipo, g, seg[ini:end]))
+            nuevas = [_mencion(tipo, g, txt)]
+        for m in nuevas:
+            m["ini"], m["fin"] = ini, end
+        out += nuevas
         fin = end
     return out
+
+
+SEP_RANGO = r"\b(?:a|al|hasta)\b|→|->|\.\.|[–—-]"
+SEP_LISTA = r"[,;\n]|\b(?:y|e)\b"
+
+
+def _une_rango(sep, seg, ms):
+    """True si el texto entre dos fechas las une en un rango (y no en una lista)."""
+    if re.search(SEP_RANGO, sep):
+        return True
+    if re.search(SEP_LISTA, sep):
+        # "entre julio y diciembre": la "y" une un rango
+        return (len(ms) == 2 and re.search(r"\by\b", sep) is not None
+                and re.search(r"\bentre\b", seg[:ms[0]["ini"]]) is not None)
+    return len(ms) == 2             # "fact_x 2025-01-01 2025-02-01"
+
+
+def _grupos(ms, seg):
+    """Agrupa las menciones: cada grupo es un dia/mes/año suelto o un rango [desde, hasta].
+
+    "2025-01-05, 2025-01-17, 2025-05-01 → 2025-05-03"  -> 3 grupos (el ultimo, rango)
+    "de enero a marzo 2025"                            -> 1 grupo (rango)
+    """
+    grupos = []
+    for i, m in enumerate(ms):
+        if i and m.get("par"):
+            grupos[-1].append(m)
+        elif i == 0 or m.get("suelta"):
+            grupos.append([m])
+        elif len(grupos[-1]) == 1 and _une_rango(seg[ms[i - 1]["fin"]:m["ini"]], seg, ms):
+            grupos[-1].append(m)
+        else:
+            grupos.append([m])
+    return grupos
 
 
 def _mencion(tipo, g, txt):
@@ -220,8 +275,45 @@ def _rango_valido(ms, seg, ayer):
     return desde, hasta
 
 
+def _dias(desde, hasta):
+    out, d = [], desde
+    while d <= hasta:
+        out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def _fechas_sueltas(grupos, ayer):
+    """Dias de una lista de grupos (cada uno: un dia, un mes, un año o un rango)."""
+    fechas = set()
+    for g in grupos:
+        try:
+            a, b = _ini(g[0], ayer), _fin(g[-1], ayer)
+            if a > b and g[0].get("inferido"):
+                g[0]["y"] -= 1
+                a = _ini(g[0], ayer)
+        except ValueError as e:        # fecha imposible, ej. 31 de junio
+            raise PedidoInvalido(f"fecha invalida ({e})")
+        if a > b:
+            raise PedidoInvalido(f"rango al reves ({a} > {b})")
+        fechas.update(_dias(a, b))
+    return sorted(fechas)
+
+
+def _dias_declarados(seg):
+    """El "N dias" que el pedido dice tener (ej. "— 8 días:"), para controlar."""
+    for m in re.finditer(r"\b(\d{1,4})\s+dias\b", seg):
+        if not re.search(r"ultim[oa]s?\s+$", seg[:m.start()]):
+            return int(m.group(1))
+    return None
+
+
 def interpretar_local(texto, conocidas=(), hoy=None):
-    """[{tabla, desde, hasta, nota, forzar_unload, solo_mover}] o PedidoInvalido."""
+    """[{tabla, desde, hasta, fechas, nota, forzar_unload, solo_mover}] o PedidoInvalido.
+
+    fechas: None si es un rango continuo; si el pedido lista dias sueltos
+    (o varios tramos), la lista exacta de dias, y desde/hasta son sus extremos.
+    """
     hoy = hoy or date.today()
     ayer = hoy - timedelta(days=1)
     t = _norm(texto)
@@ -269,16 +361,27 @@ def interpretar_local(texto, conocidas=(), hoy=None):
             errores.append(f"{tr['ref']}: no dice fechas")
             continue
         _completar_anios(ms, anio_ctx)
+        grupos = _grupos(ms, tr["seg"])
+        sin_anio = not explicito and all(m.get("inferido") or not m.get("y") for m in ms)
         try:
-            desde, hasta = _rango_valido(ms, tr["seg"], ayer)
-            sin_anio = not explicito and all(m.get("inferido") or not m.get("y") for m in ms)
-            if sin_anio and hasta > ayer and any(m.get("inferido") for m in ms):
-                # sin año en ningun lado: el año mas reciente en que el rango ya
-                # paso entero ("julio a diciembre" dicho en septiembre = el anterior)
-                for m in ms:
-                    if m.get("inferido"):
-                        m["y"] -= 1
+            if len(grupos) > 1:
+                fechas = _fechas_sueltas(grupos, ayer)
+                if sin_anio and fechas[-1] > ayer and any(m.get("inferido") for m in ms):
+                    for m in ms:
+                        if m.get("inferido"):
+                            m["y"] -= 1
+                    fechas = _fechas_sueltas(_grupos(ms, tr["seg"]), ayer)
+                desde, hasta = fechas[0], fechas[-1]
+            else:
+                fechas = None
                 desde, hasta = _rango_valido(ms, tr["seg"], ayer)
+                if sin_anio and hasta > ayer and any(m.get("inferido") for m in ms):
+                    # sin año en ningun lado: el año mas reciente en que el rango ya
+                    # paso entero ("julio a diciembre" dicho en septiembre = el anterior)
+                    for m in ms:
+                        if m.get("inferido"):
+                            m["y"] -= 1
+                    desde, hasta = _rango_valido(ms, tr["seg"], ayer)
         except PedidoInvalido as e:
             errores.append(f"{tr['ref']}: {e}")
             continue
@@ -288,7 +391,21 @@ def interpretar_local(texto, conocidas=(), hoy=None):
         notas = []
         if tr.get("heredado"):
             notas.append(f"mismo rango que {tr['heredado']}")
-        if hasta > ayer:
+        declarados = _dias_declarados(tr["seg"])
+        n = len(fechas) if fechas else (hasta - desde).days + 1
+        if declarados is not None and declarados != n:
+            notas.append(f"ojo: el pedido dice {declarados} dias y encontre {n}")
+        if fechas:
+            futuras = [f for f in fechas if f > ayer]
+            if futuras:
+                fechas = [f for f in fechas if f <= ayer]
+                notas.append(f"sin {len(futuras)} dia(s) desde hoy en adelante: "
+                             + ", ".join(str(f) for f in futuras[:3]))
+            if not fechas:
+                errores.append(f"{tr['ref']}: todos los dias pedidos son de hoy en adelante")
+                continue
+            desde, hasta = fechas[0], fechas[-1]
+        elif hasta > ayer:
             hasta = ayer
             notas.append("hasta recortado a ayer")
         if desde > hasta:
@@ -296,6 +413,7 @@ def interpretar_local(texto, conocidas=(), hoy=None):
             continue
         items.append({
             "tabla": tr["ref"], "desde": str(desde), "hasta": str(hasta),
+            "fechas": [str(f) for f in fechas] if fechas else None,
             "nota": "; ".join(notas),
             "forzar_unload": bool(re.search(r"\bforz", tr["seg"])),
             "solo_mover": bool(re.search(r"\bsolo[\s_-]*mov|\bsin (?:correr el )?unload\b", tr["seg"])),
@@ -319,14 +437,20 @@ Pedido:
 
 Formato exacto:
 {{"items": [{{"tabla": "...", "desde": "AAAA-MM-DD", "hasta": "AAAA-MM-DD",
-             "forzar_unload": false, "solo_mover": false}}],
+             "fechas": null, "forzar_unload": false, "solo_mover": false}}],
   "dudas": []}}
 
 Reglas:
 - Un item por tabla, en el orden del pedido.
 - "tabla": si se refiere a una de las tablas conocidas (aunque la abrevie), su
   nombre exacto; si no, como la escribio el usuario (con esquema si lo dio:
-  esquema.tabla). Si la nombra por numero ("la 7", "tabla 7"), pone "7".
+  esquema.tabla; "esquema__tabla" es lo mismo). Si la nombra por numero
+  ("la 7", "tabla 7"), pone "7".
+- Rango continuo ("de enero a marzo"): desde/hasta y "fechas": null.
+- Dias especificos o varios tramos sueltos ("2025-01-05, 2025-01-17",
+  "5, 17 y 28 de enero", "2025-05-01 → 2025-05-03, 2025-07-11"): en "fechas"
+  la lista COMPLETA de dias AAAA-MM-DD (cada sub-rango expandido dia por dia),
+  y desde/hasta = el primero y el ultimo. No lo conviertas en un rango.
 - Fechas inclusivas. Un mes: del 1 al ultimo dia. Un año: 1-ene a 31-dic.
   "Fin de año": 31-dic del año en contexto.
 - Si no dice el año, usa el del contexto del pedido. Si no hay ninguno, el año
@@ -402,14 +526,30 @@ def interpretar_claude(texto, conocidas, hoy=None, timeout=180):
         if not tabla or not _fecha_ok(desde) or not _fecha_ok(hasta):
             dudas.append(f"item descartado por incompleto: {json.dumps(it, ensure_ascii=False)}")
             continue
-        nota = []
-        if hasta > str(ayer):
+        nota, fechas = [], None
+        if isinstance(it.get("fechas"), list) and it["fechas"]:
+            fechas = sorted({str(f) for f in it["fechas"]})
+            malas = [f for f in fechas if not _fecha_ok(f)]
+            if malas:
+                dudas.append(f"{tabla}: fechas invalidas {malas[:3]}; item descartado")
+                continue
+            futuras = [f for f in fechas if f > str(ayer)]
+            if futuras:
+                fechas = [f for f in fechas if f <= str(ayer)]
+                nota.append(f"sin {len(futuras)} dia(s) desde hoy en adelante: "
+                            + ", ".join(futuras[:3]))
+            if not fechas:
+                dudas.append(f"{tabla}: todos los dias pedidos son de hoy en adelante")
+                continue
+            desde, hasta = fechas[0], fechas[-1]
+        elif hasta > str(ayer):
             hasta = str(ayer)
             nota.append("hasta recortado a ayer")
         if desde > hasta:
             dudas.append(f"{tabla}: rango vacio ({desde} > {hasta})")
             continue
-        items.append({"tabla": tabla, "desde": desde, "hasta": hasta, "nota": "; ".join(nota),
+        items.append({"tabla": tabla, "desde": desde, "hasta": hasta, "fechas": fechas,
+                      "nota": "; ".join(nota),
                       "forzar_unload": it.get("forzar_unload") is True,
                       "solo_mover": it.get("solo_mover") is True})
     if not items:
@@ -422,8 +562,10 @@ def mismo_plan(a, b):
     if len(a) != len(b):
         return False
     for x, y in zip(a, b):
-        tx, ty = _norm(x["tabla"]), _norm(y["tabla"])
+        tx, ty = _norm(x["tabla"]).replace("__", "."), _norm(y["tabla"]).replace("__", ".")
         if (x["desde"], x["hasta"]) != (y["desde"], y["hasta"]):
+            return False
+        if (x.get("fechas") or None) != (y.get("fechas") or None):
             return False
         if tx not in ty and ty not in tx:
             return False

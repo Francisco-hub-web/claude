@@ -29,6 +29,8 @@ Varias tablas, en texto libre (una tras otra, sin preguntas en el medio):
     flow "tran_item del 4 de julio 2025 a fin de año, despues fact_x de enero a marzo 2026"
     flow --pegar                              pegas el pedido (termina con Ctrl-D)
     flow --cola                               retoma la ultima cola (VPN, SSO, Ctrl-C)
+    flow "chi_easy_dim_vw__fact_x — 2025-01-05, 2025-01-17, 2025-05-01 → 2025-05-03"
+                                              dias especificos (lista, sub-rangos con →)
   Lo interpreta Claude Code (claude -p) si esta instalado, si no un parser
   local; muestra el plan con fechas explicitas y pide confirmacion.
   Si una sesion SSO vence, hace el login solo (FLOW_LOGIN_CMD para cambiarlo).
@@ -40,6 +42,9 @@ Uso:
     flow 7 --solo-dag --desde ... --hasta ... dispara y espera, no mueve
     flow 7 --run manual__2026-09-16T19:12:17Z retoma un run ya disparado
     flow 7 --solo-mover [--desde ... --hasta ...]
+    flow 7 --particion 2025-01-05,2025-05-01..2025-05-03
+                                              solo esos dias (pipeline completo: UNLOAD
+                                              filtrado con load_dates, mover y verificar)
     flow 7 ... --no-sync                      no toca el JSON (solo valida)
     flow 7 ... --forzar-unload                baja todo el rango de Redshift aunque
                                               ya este en el landing
@@ -53,7 +58,7 @@ Requiere unload.py en el mismo directorio, boto3 + requests (como mwaa_cert)
 y psycopg2 solo si genera o valida contra Redshift (FLOW_RS_PASS).
 """
 
-__version__ = "2.4"
+__version__ = "2.5"
 
 import json
 import os
@@ -243,8 +248,8 @@ def tags_de(d):
     return {t.get("name") if isinstance(t, dict) else t for t in (d.get("tags") or [])}
 
 
-def trigger_dag(s, host, dag_id, desde, hasta):
-    """Dispara el DAG con el rango por conf ('Trigger w/ config')."""
+def trigger_dag(s, host, dag_id, desde, hasta, fechas=None):
+    """Dispara el DAG por conf ('Trigger w/ config'): el rango, o dias sueltos."""
     d = api(s, host, "GET", f"dags/{dag_id}")
     if d is None:
         U.bad(f"No encontre el DAG '{dag_id}' en MWAA.")
@@ -254,9 +259,14 @@ def trigger_dag(s, host, dag_id, desde, hasta):
         api(s, host, "PATCH", f"dags/{dag_id}", {"is_paused": False})
 
     t0 = datetime.now(timezone.utc)
-    body = {"dag_run_id": f"manual__{t0:%Y-%m-%dT%H:%M:%SZ}",
-            "conf": {"load_start": desde, "load_end": hasta}}
-    print(f"  conf: load_start={desde}  load_end={hasta}")
+    conf = {"load_start": desde, "load_end": hasta}
+    if fechas:
+        conf["load_dates"] = ",".join(fechas)
+    body = {"dag_run_id": f"manual__{t0:%Y-%m-%dT%H:%M:%SZ}", "conf": conf}
+    if fechas:
+        print(f"  conf: load_dates={len(fechas)} dias ({U.rangos(fechas, 4)})")
+    else:
+        print(f"  conf: load_start={desde}  load_end={hasta}")
     r = api(s, host, "POST", f"dags/{dag_id}/dagRuns", body)
     if not r:
         return None, None
@@ -645,9 +655,23 @@ def generador_es_estricto(txt):
     return bool(txt) and "set_schema_source" in txt and STRICT_TAG in txt
 
 
+def generador_con_dias(txt):
+    """El generador acepta dias sueltos (param load_dates, kit v9.5+)."""
+    return bool(txt) and "load_dates" in txt and "fechas_sql" in txt
+
+
+# Lineas de versiones anteriores del generador que el del kit reemplaza a
+# proposito: no son personalizaciones tuyas.
+KIT_REEMPLAZADAS = {
+    'tags=["RAW-DATA-PIPELINE", "FCSM"],',
+    "WHERE {self.column_dt} BETWEEN '{{{{ params.load_start }}}}' AND "
+    "'{{{{ params.load_end }}}}'",
+}
+
+
 def cmd_desplegar_generador():
     """Reemplaza el generador desplegado por el del kit, en su MISMA ruta."""
-    U.title("Desplegar generador con modo estricto")
+    U.title("Desplegar el generador del kit")
     if not KIT_GENERATOR.exists():
         U.bad(f"No encuentro el generador del kit: {KIT_GENERATOR}")
         return False
@@ -657,15 +681,25 @@ def cmd_desplegar_generador():
         return False
     uri = f"s3://{S3_DAGS_BUCKET}/{k}"
     print(f"  Desplegado : {uri}")
-    if generador_es_estricto(actual):
-        U.ok("Ya tiene el modo estricto: no hay nada que desplegar.")
+    if generador_es_estricto(actual) and generador_con_dias(actual):
+        U.ok("Ya tiene modo estricto y dias sueltos: no hay nada que desplegar.")
         return True
+    U.info("Le falta: " + ", ".join(
+        f for f, ok in (("modo estricto", generador_es_estricto(actual)),
+                        ("dias sueltos (load_dates)", generador_con_dias(actual))) if not ok))
 
     nuevo = KIT_GENERATOR.read_text()
     # lineas del desplegado que el nuevo no trae: si hay personalizaciones, se ven aca
     norm = lambda s: {l.strip() for l in s.splitlines() if l.strip() and not l.strip().startswith("#")}
-    perdidas = sorted(norm(actual) - norm(nuevo))
+    todas = norm(actual) - norm(nuevo)
+    conocidas = sorted(todas & KIT_REEMPLAZADAS)
+    perdidas = sorted(todas - KIT_REEMPLAZADAS)
     print(f"  Nuevo      : {KIT_GENERATOR}")
+    if conocidas:
+        U.info(f"{len(conocidas)} linea(s) de la version anterior del kit se reemplazan "
+               "(esperado):")
+        for l in conocidas:
+            U.info(f"  {l[:100]}")
     if perdidas:
         print()
         U.warn(f"{len(perdidas)} lineas del generador desplegado no estan en el nuevo:")
@@ -688,7 +722,7 @@ def cmd_desplegar_generador():
     r = U.aws(["s3", "cp", str(KIT_GENERATOR), uri, "--only-show-errors"],
               MWAA_PROFILE, parse=False, check=False)
     txt = U.aws(["s3", "cp", uri, "-"], MWAA_PROFILE, parse=False, check=False)
-    if r is None or not generador_es_estricto(txt):
+    if r is None or not (generador_es_estricto(txt) and generador_con_dias(txt)):
         U.bad("No pude verificar el despliegue.")
         return False
     U.ok("Generador desplegado y verificado en S3.")
@@ -1234,6 +1268,15 @@ def esperar_unload(cfg, s, host, dag_id, run_id, t0, sel):
         conf = r.get("conf") or {}
         parts = [p for p in particiones_de_la_corrida(cfg, t_ini)
                  if conf.get("load_start", "") <= p <= conf.get("load_end", "9999")]
+        pedidas = {f.strip() for f in str(conf.get("load_dates") or "").split(",") if f.strip()}
+        if pedidas:
+            extra = [p for p in parts if p not in pedidas]
+            parts = [p for p in parts if p in pedidas]
+            if extra:
+                U.warn(f"El UNLOAD escribio {len(extra)} dias que no se pidieron "
+                       f"({U.rangos(extra, 3)}): no se mueven.")
+                U.info("El DAG ignoro load_dates: desplega el generador del kit "
+                       "(flow --desplegar-generador).")
         if parts:
             print(f"  Esta corrida escribio {len(parts)} particiones: {U.rangos(parts, 3)}")
         else:
@@ -1241,13 +1284,51 @@ def esperar_unload(cfg, s, host, dag_id, run_id, t0, sel):
     return r
 
 
-def tramos_a_bajar(fechas):
-    """Rangos de UNLOAD que cubren 'fechas': uno por tramo continuo (hasta 3),
-    o uno solo de punta a punta si estan muy salteadas."""
+_SOPORTA_DIAS = {}
+
+
+def dag_soporta_dias(s, host, dag_id):
+    """True si el DAG que MWAA tiene parseado acepta load_dates (generador v9.5+).
+
+    Se pregunta a MWAA y no al archivo en S3: si el generador se desplego pero
+    MWAA todavia no lo re-parseo, un conf con load_dates se ignoraria y el
+    UNLOAD bajaria el rango completo de punta a punta.
+    """
+    if dag_id not in _SOPORTA_DIAS:
+        d = api(s, host, "GET", f"dags/{dag_id}/details", silencioso=True)
+        _SOPORTA_DIAS[dag_id] = isinstance(d, dict) and "load_dates" in (d.get("params") or {})
+    return _SOPORTA_DIAS[dag_id]
+
+
+def tramos_unload(fechas, exactas, soporta_dias):
+    """Corridas de UNLOAD para bajar 'fechas': [{desde, hasta, fechas}].
+
+    Un tramo continuo: un run con desde/hasta. Varios tramos: si el DAG acepta
+    load_dates, UN solo run con la lista exacta. Si no: un run por tramo
+    (dias pedidos a mano), o en un rango con muchos huecos uno de punta a punta.
+    """
     bs = U.bloques(fechas)
-    if len(bs) <= 3:
-        return [(a, b) for a, b, _ in bs]
-    return [(min(fechas), max(fechas))]
+    if len(bs) == 1:
+        return [{"desde": bs[0][0], "hasta": bs[0][1], "fechas": None}]
+    if soporta_dias:
+        return [{"desde": fechas[0], "hasta": fechas[-1], "fechas": list(fechas)}]
+    if exactas or len(bs) <= 3:
+        return [{"desde": a, "hasta": b, "fechas": None} for a, b, _ in bs]
+    return [{"desde": min(fechas), "hasta": max(fechas), "fechas": None}]
+
+
+def expandir_fechas(vals):
+    """['2025-01-05', 'calendar_dt=2025-01-17', '2025-05-01..2025-05-03'] -> dias ordenados."""
+    out = set()
+    for v in vals:
+        v = v.split("=", 1)[-1].strip()
+        a, _, b = v.partition("..")
+        d = datetime.strptime(a.strip(), "%Y-%m-%d").date()
+        h = datetime.strptime(b.strip(), "%Y-%m-%d").date() if b else d
+        if h < d:
+            raise ValueError(f"rango al reves: {v}")
+        out.update(rango_a_parts(str(d), str(h)))
+    return sorted(out)
 
 
 def esperar_run_en_curso(cfg, s, host, dag_id, sel):
@@ -1263,8 +1344,16 @@ def esperar_run_en_curso(cfg, s, host, dag_id, sel):
     return esperar_unload(cfg, s, host, dag_id, rid, None, sel) is not None
 
 
+def fechas_cli(fechas):
+    """['2025-05-01','2025-05-02','2025-07-11'] -> '2025-05-01..2025-05-02,2025-07-11'."""
+    return ",".join(a if n == 1 else f"{a}..{b}" for a, b, n in U.bloques(fechas))
+
+
+SIN_DATOS = []        # dias pedidos que el UNLOAD no encontro en el origen
+
+
 def run_flow(cfg, o):
-    global PASO_ACTUAL
+    global PASO_ACTUAL, SIN_DATOS
     PASO_ACTUAL = ""
     schema, table = cfg["schema"], cfg["table"]
     dag_id = DAG_ID_TPL.format(schema=schema, table=table)
@@ -1292,7 +1381,10 @@ def run_flow(cfg, o):
     print()
     print(f"{C.B}Pipeline: {schema}.{table}{C.END}")
     print(f"  DAG    : {dag_id}")
-    if o["desde"] and ("disparar" in plan or o["solo_mover"]):
+    pedidas = o.get("fechas")            # dias especificos (None = rango continuo)
+    if pedidas:
+        print(f"  Dias   : {len(pedidas)} especificos: {U.rangos(pedidas, 6)}")
+    elif o["desde"] and ("disparar" in plan or o["solo_mover"]):
         print(f"  Rango  : {o['desde']}  ->  {o['hasta']}")
     if o["run_id"]:
         print(f"  Run    : {o['run_id']}")
@@ -1310,7 +1402,8 @@ def run_flow(cfg, o):
         U.info("En el listado, los de backfill aparecen como [only_unload].")
         return False
 
-    rango = rango_a_parts(o["desde"], o["hasta"]) if o["desde"] and o["hasta"] else None
+    SIN_DATOS = []
+    rango = pedidas or (rango_a_parts(o["desde"], o["hasta"]) if o["desde"] and o["hasta"] else None)
     okey = False
     with U.KeepAwake():
         s = host = None
@@ -1370,8 +1463,20 @@ def run_flow(cfg, o):
                 U.info(f"Para cargar:  flow {sel} --desde AAAA-MM-DD --hasta AAAA-MM-DD")
                 return True
 
+        def a_bajar(fechas):
+            """Corridas de UNLOAD para esas fechas (una sola si el DAG acepta load_dates)."""
+            varios = len(U.bloques(fechas)) > 1
+            soporta = varios and dag_soporta_dias(s, host, dag_id)
+            if varios and pedidas and not soporta:
+                U.warn("El DAG todavia no acepta dias sueltos (generador anterior a v9.5):")
+                U.info(f"corro un UNLOAD por tramo ({len(U.bloques(fechas))} runs). Para "
+                       "hacerlo en uno solo:  flow --desplegar-generador")
+            return tramos_unload(fechas, bool(pedidas), soporta)
+
         # ── landing: lo que ya esta y es valido no se vuelve a bajar ──
-        tramos = [(o["desde"], o["hasta"])] if "disparar" in plan else []
+        tramos = []
+        if "disparar" in plan and "landing" not in plan:
+            tramos = a_bajar(rango)
         sirven = None
         if "landing" in plan:
             paso("Revisando lo que ya esta en el landing")
@@ -1381,14 +1486,16 @@ def run_flow(cfg, o):
             necesitan = sorted(set(faltan) | set(descartes))
             print()
             if not necesitan:
-                U.ok("Todo el rango ya esta en el landing y es valido: no se corre el UNLOAD.")
+                U.ok(("Todos los dias pedidos ya estan" if pedidas else "Todo el rango ya esta")
+                     + " en el landing y son validos: no se corre el UNLOAD.")
                 U.info("Para bajarlo igual de Redshift:  --forzar-unload")
-                tramos = []
             else:
-                tramos = tramos_a_bajar(necesitan)
+                tramos = a_bajar(necesitan)
                 print(f"  UNLOAD solo para lo que falta ({len(necesitan)} fechas):")
-                for a, b in tramos:
-                    U.info(f"{a} .. {b}")
+                for t in tramos:
+                    U.info(f"{len(t['fechas'])} dias sueltos en un solo UNLOAD: "
+                           f"{U.rangos(t['fechas'], 4)}" if t["fechas"]
+                           else f"{t['desde']} .. {t['hasta']}")
 
         # ── disparar y esperar ──
         corrio = False
@@ -1408,7 +1515,8 @@ def run_flow(cfg, o):
                     else:
                         print()
                         print(f"  {C.B}Tramo {k + 1}/{len(lista)}{C.END}")
-                    run_id, t0 = trigger_dag(s, host, dag_id, *tramo)
+                    run_id, t0 = trigger_dag(s, host, dag_id, tramo["desde"],
+                                             tramo["hasta"], tramo["fechas"])
                     if not run_id:
                         return False
                 if k == 0:
@@ -1419,15 +1527,20 @@ def run_flow(cfg, o):
                 corrio = True
                 if o["run_id"]:
                     conf = r.get("conf") or {}
-                    if conf.get("load_start") and conf.get("load_end"):
+                    if conf.get("load_dates"):
+                        rango = expandir_fechas(str(conf["load_dates"]).split(","))
+                    elif conf.get("load_start") and conf.get("load_end"):
                         rango = rango_a_parts(conf["load_start"], conf["load_end"])
                     else:
                         t_ini = parse_iso(r.get("start_date"))
                         rango = particiones_de_la_corrida(cfg, t_ini) if t_ini else None
             if o["solo_dag"]:
                 print()
-                U.info(f"Para mover:  flow {sel} --solo-mover"
-                       + (f" --desde {rango[0]} --hasta {rango[-1]}" if rango else ""))
+                if pedidas:
+                    U.info(f"Para mover:  flow {sel} --solo-mover --particion {fechas_cli(rango)}")
+                else:
+                    U.info(f"Para mover:  flow {sel} --solo-mover"
+                           + (f" --desde {rango[0]} --hasta {rango[-1]}" if rango else ""))
                 return True
 
         # ── mover y verificar ──
@@ -1442,7 +1555,10 @@ def run_flow(cfg, o):
                 U.bad(str(e))
                 return False
             if corrio and faltan:
-                U.info(f"{len(faltan)} fechas sin datos en el origen: el UNLOAD no escribio nada.")
+                SIN_DATOS = faltan
+                (U.warn if pedidas else U.info)(
+                    f"{len(faltan)} fechas sin datos en el origen (el UNLOAD no escribio "
+                    f"nada): {U.rangos(faltan, 4)}")
         if not sirven:
             U.bad("No hay particiones validas para mover en el landing.")
             return False
@@ -1530,7 +1646,9 @@ def resolver_tabla(ref, defs):
     parte del nombre); si no hay, la tabla destino en el Glue Catalog: en ese
     caso el JSON se genera desde el destino al correrla.
     """
-    r = ref.strip().lower().strip(".,;:")
+    r = ref.strip().lower().strip(".,;:*")
+    if "__" in r and "." not in r:          # nombre de Glue: esquema__tabla
+        r = r.replace("__", ".", 1)
     bf = [d for d in defs if d.get("only_unload") is True]
 
     def de_json(d):
@@ -1600,12 +1718,23 @@ def interpretar(texto, defs):
         print("  Interpretando el pedido con Claude Code...", end=" ", flush=True)
         items, dudas, err_claude = P.interpretar_claude(texto, conocidas, hoy)
         print("listo" if items else "no disponible")
+    if items and local and len(local) == len(items):
+        # Claude convirtio en rango una lista de dias que el parser local leyo
+        # exacta: se usa la lista (nunca se baja mas de lo pedido).
+        for k, (lo, cl) in enumerate(zip(local, items)):
+            if lo.get("fechas") and not cl.get("fechas") and \
+                    cl["desde"] <= lo["fechas"][0] and lo["fechas"][-1] <= cl["hasta"]:
+                U.warn(f"Claude Code leyo un rango para {cl['tabla']}; uso los "
+                       f"{len(lo['fechas'])} dias exactos del pedido.")
+                items[k] = {**cl, "fechas": lo["fechas"], "desde": lo["desde"],
+                            "hasta": lo["hasta"]}
     if items:
         fuente = "Claude Code"
         if local and not P.mismo_plan(local, items):
             U.warn("Ojo: el parser local lo entendio distinto:")
             for it in local:
-                U.info(f"{it['tabla']}  {it['desde']} .. {it['hasta']}")
+                U.info(f"{it['tabla']}  " + (f"{len(it['fechas'])} dias: {U.rangos(it['fechas'], 5)}"
+                                             if it.get("fechas") else f"{it['desde']} .. {it['hasta']}"))
         elif local:
             fuente += " (el parser local coincide)"
     elif local:
@@ -1632,10 +1761,15 @@ def mostrar_plan(items):
     w = max(len(f"{i['schema']}.{i['table']}") for i in items)
     for k, it in enumerate(items, 1):
         sel = f"{it['schema']}.{it['table']}"
-        dias = (date.fromisoformat(it["hasta"]) - date.fromisoformat(it["desde"])).days + 1
         hecho = f"  {C.OK}(ya hecha){C.END}" if it.get("estado") in HECHO else ""
-        print(f"  {C.B}{k}.{C.END} {sel:<{w}}  {it['desde']} .. {it['hasta']}  "
-              f"{C.DIM}{dias} dias{C.END}{hecho}")
+        if it.get("fechas"):
+            print(f"  {C.B}{k}.{C.END} {sel:<{w}}  {len(it['fechas'])} dias especificos{hecho}")
+            for a, b, n in U.bloques(it["fechas"]):
+                print(f"       {C.DIM}{a}{f' .. {b}  ({n} dias)' if n > 1 else ''}{C.END}")
+        else:
+            dias = (date.fromisoformat(it["hasta"]) - date.fromisoformat(it["desde"])).days + 1
+            print(f"  {C.B}{k}.{C.END} {sel:<{w}}  {it['desde']} .. {it['hasta']}  "
+                  f"{C.DIM}{dias} dias{C.END}{hecho}")
         if it.get("nuevo"):
             U.info("sin JSON: se genera desde la tabla destino y se publica")
         if it.get("forzar_unload"):
@@ -1713,6 +1847,7 @@ def cmd_cola(texto):
                 errores.append(f'"{it["tabla"]}": {err}')
                 continue
             plan.append({**t, "desde": it["desde"], "hasta": it["hasta"],
+                         "fechas": it.get("fechas") or None,
                          "nota": it.get("nota", ""), "estado": "pendiente",
                          "forzar_unload": bool(it.get("forzar_unload")),
                          "solo_mover": bool(it.get("solo_mover"))})
@@ -1782,7 +1917,7 @@ def _correr_item(it):
         o = {"desde": it["desde"], "hasta": it["hasta"], "run_id": None,
              "solo_dag": False, "solo_mover": bool(it.get("solo_mover")),
              "solo_sync": False, "solo_json": False, "no_sync": False, "prep": prep,
-             "forzar_unload": bool(it.get("forzar_unload"))}
+             "forzar_unload": bool(it.get("forzar_unload")), "fechas": it.get("fechas")}
         U.SOLO_PARTS, U.SOLO_PARTS_RANGO = None, False
         del U.ERRORES[:]
         try:
@@ -1795,6 +1930,7 @@ def _correr_item(it):
             ok = False
         if prep and Path(cfg["_file"]).exists():
             it["json_nuevo"] = str(cfg["_file"])
+        it["sin_datos"] = list(SIN_DATOS)
         if ok:
             return "ok"
         if PASO_ACTUAL == "Verificacion final":
@@ -1824,8 +1960,9 @@ def run_cola(cola):
                 continue
             print()
             print(f"{C.B}{'═' * 64}{C.END}")
-            print(f"{C.B}  Tabla {k}/{len(items)}: {it['schema']}.{it['table']}   "
-                  f"{it['desde']} .. {it['hasta']}{C.END}")
+            cuando = (f"{len(it['fechas'])} dias especificos" if it.get("fechas")
+                      else f"{it['desde']} .. {it['hasta']}")
+            print(f"{C.B}  Tabla {k}/{len(items)}: {it['schema']}.{it['table']}   {cuando}{C.END}")
             print(f"{C.B}{'═' * 64}{C.END}")
             it.update(estado="en curso", inicio=_ahora(), detalle="")
             guardar_cola(cola)
@@ -1862,11 +1999,15 @@ def resumen_cola(cola, t0):
     w = max(len(f"{i['schema']}.{i['table']}") for i in items)
     for it in items:
         e = it["estado"]
+        cuando = (f"{len(it['fechas'])} dias especificos" if it.get("fechas")
+                  else f"{it['desde']} .. {it['hasta']}")
         print(f"  {icono.get(e, '·')} {it['schema'] + '.' + it['table']:<{w}}  "
-              f"{it['desde']} .. {it['hasta']}  {texto.get(e, e)}  "
-              f"{C.DIM}{it.get('duracion', '')}{C.END}")
+              f"{cuando}  {texto.get(e, e)}  {C.DIM}{it.get('duracion', '')}{C.END}")
         if it.get("detalle") and e in ("fallo", "obs"):
             U.info(it["detalle"])
+        if it.get("sin_datos") and e in HECHO:
+            U.info(f"{len(it['sin_datos'])} dias sin datos en el origen: "
+                   f"{U.rangos(it['sin_datos'], 4)}")
     if any(i["estado"] not in HECHO for i in items):
         print()
         U.info("Para seguir con lo que falta:  flow --cola")
@@ -1907,11 +2048,20 @@ def main():
         "solo_dag": "--solo-dag" in flags, "solo_mover": "--solo-mover" in flags,
         "solo_sync": "--solo-sync" in flags, "solo_json": "--solo-json" in flags,
         "no_sync": "--no-sync" in flags, "prep": None,
-        "forzar_unload": "--forzar-unload" in flags,
+        "forzar_unload": "--forzar-unload" in flags, "fechas": None,
     }
     U.AUTO = bool(flags & {"--auto", "--auto-borrar"})
     U.AUTO_BORRAR = "--auto-borrar" in flags
     U.SOLO_PARTS = U.parse_solo_parts(args)
+    # --particion / --particiones-archivo: dias especificos (tambien "a..b"),
+    # para el pipeline completo o para --solo-mover
+    if U.SOLO_PARTS and not o["run_id"]:
+        try:
+            o["fechas"] = expandir_fechas(U.SOLO_PARTS)
+        except ValueError as e:
+            U.bad(f"--particion invalida: {e} (formato AAAA-MM-DD o AAAA-MM-DD..AAAA-MM-DD)")
+            sys.exit(1)
+        o["desde"], o["hasta"] = o["fechas"][0], o["fechas"][-1]
 
     print(f"{C.DIM}flow v{__version__} (unload v{U.__version__}){C.END}")
 
@@ -1944,6 +2094,8 @@ def main():
         sys.exit(1)
 
     arg = pos[0] if pos else None
+    if arg and "__" in arg and "." not in arg:        # nombre de Glue: esquema__tabla
+        arg = arg.replace("__", ".", 1)
     if arg and "." in arg and not arg.isdigit():
         schema, table = arg.strip().lower().split(".", 1)
         ya = [d for d in defs if d["schema"] == schema and d["table"] == table]
@@ -1961,7 +2113,8 @@ def main():
         cfg["_sel"] = str(defs.index(cfg) + 1)
     cfg["_glue_table"] = U.GLUE_TABLE_TPL.format(schema=cfg["schema"], table=cfg["table"])
 
-    necesita_rango = not (o["solo_mover"] or o["solo_sync"] or o["solo_json"] or o["run_id"])
+    necesita_rango = not (o["solo_mover"] or o["solo_sync"] or o["solo_json"] or o["run_id"]
+                          or o["fechas"])
     if necesita_rango:
         if not o["desde"]:
             o["desde"] = input("  Desde [2026-01-01]: ").strip() or "2026-01-01"

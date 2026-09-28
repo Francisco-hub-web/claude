@@ -35,6 +35,28 @@ DEFAULT_REDSHIFT_CONN_ID = "catman_redshift_cl_edw_prod"
 # ---------------------------------------------------------------------------
 STRICT_TAG = "SCHEMA-STRICT"
 
+# ---------------------------------------------------------------------------
+# DIAS SUELTOS (param "load_dates")
+#
+# Con conf {"load_dates": "2025-01-05,2025-01-17,2025-05-01"} el UNLOAD filtra
+# column_dt IN (...) y baja SOLO esos dias, en una sola corrida. Sin
+# load_dates (o vacio) filtra BETWEEN load_start AND load_end, como siempre.
+# Cada fecha se valida antes de armar el SQL (filtro fechas_sql): un valor que
+# no sea AAAA-MM-DD hace fallar la tarea sin ejecutar nada en Redshift.
+# ---------------------------------------------------------------------------
+PATRON_FECHAS = r"^$|^\s*\d{4}-\d{2}-\d{2}(\s*,\s*\d{4}-\d{2}-\d{2})*\s*$"
+
+
+def fechas_sql(valor):
+    """'2025-01-05, 2025-01-17' -> "'2025-01-05','2025-01-17'" (valida cada una)."""
+    fechas = [f.strip() for f in str(valor or "").split(",") if f.strip()]
+    if not fechas:
+        raise ValueError("load_dates esta vacio")
+    for f in fechas:
+        if len(f) != 10 or datetime.strptime(f, "%Y-%m-%d").strftime("%Y-%m-%d") != f:
+            raise ValueError(f"load_dates: '{f}' no es una fecha AAAA-MM-DD")
+    return ",".join(f"'{f}'" for f in sorted(set(fechas)))
+
 
 def rs_cast_type(glue_type):
     """Tipo del Glue Catalog -> tipo de CAST en Redshift (parquet equivalente)."""
@@ -135,6 +157,7 @@ class RedshiftLoaderBuilder(ABC):
             default_args=self.dag_args,
             max_active_runs=1,
             catchup=False,
+            user_defined_filters={"fechas_sql": fechas_sql},
             params={
                 "load_start": Param(
                     default=f"2025-01-01",
@@ -149,7 +172,15 @@ class RedshiftLoaderBuilder(ABC):
                     format="date",
                     title="Hasta",
                     description="Fecha fin para la carga (YYYY-MM-DD)."
-                )
+                ),
+                "load_dates": Param(
+                    default="",
+                    type="string",
+                    pattern=PATRON_FECHAS,
+                    title="Dias sueltos (opcional)",
+                    description="Lista de fechas separadas por coma (YYYY-MM-DD). "
+                                "Si se completa, se cargan SOLO esos dias e ignora Desde/Hasta."
+                ),
             },
             tags=["RAW-DATA-PIPELINE", "FCSM"] + ([STRICT_TAG] if self.strict else []),
         ) as dag:
@@ -210,6 +241,15 @@ class RedshiftLoaderBuilder(ABC):
                 # solo en el nombre de la carpeta (calendar_dt=YYYY-MM-DD/).
                 unload_options.insert(0, f"PARTITION BY ({self.column_dt})")
 
+            # Dias sueltos (load_dates) o rango (load_start..load_end): ver arriba.
+            filtro_fechas = (
+                "{% if params.load_dates %}"
+                f"{self.column_dt} IN ({{{{ params.load_dates | fechas_sql }}}})"
+                "{% else %}"
+                f"{self.column_dt} BETWEEN '{{{{ params.load_start }}}}' AND '{{{{ params.load_end }}}}'"
+                "{% endif %}"
+            )
+
             unload_task = RedshiftToS3Operator(
                 task_id="redshift_unload",
                 select_query=f"""
@@ -217,7 +257,7 @@ class RedshiftLoaderBuilder(ABC):
                         SELECT
                             {select_clause}
                         FROM {self.schema}.{self.table_real}
-                        WHERE {self.column_dt} BETWEEN '{{{{ params.load_start }}}}' AND '{{{{ params.load_end }}}}'
+                        WHERE {filtro_fechas}
                     )
                     SELECT
                         *
