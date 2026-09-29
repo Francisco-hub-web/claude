@@ -73,6 +73,8 @@ CONECTORES = {"y", "e", "la", "las", "el", "los", "tabla", "tablas", "tambien",
               "con", "despues", "luego", "de", "del", "para", "a", "mismo",
               "rango", "igual"}
 ABIERTO = r"\b(?:desde|a partir|en adelante)\b"
+# "los dias que faltan", "huecos", "sin archivos": ingestar solo lo que no esta en destino
+FALTANTES = r"\bfalta|\bfaltante|\bhueco|\bsin (?:archivos|datos|particion)|\bvacio|\bmissing\b"
 
 
 class PedidoInvalido(ValueError):
@@ -391,10 +393,13 @@ def interpretar_local(texto, conocidas=(), hoy=None):
         notas = []
         if tr.get("heredado"):
             notas.append(f"mismo rango que {tr['heredado']}")
+        faltantes = bool(re.search(FALTANTES, tr["seg"]) or re.search(FALTANTES, prefijo))
         declarados = _dias_declarados(tr["seg"])
         n = len(fechas) if fechas else (hasta - desde).days + 1
         if declarados is not None and declarados != n:
-            notas.append(f"ojo: el pedido dice {declarados} dias y encontre {n}")
+            notas.append(f"el pedido dice {declarados} dias y el rango tiene {n}: se ingestan "
+                         "solo los que falten en destino" if faltantes
+                         else f"ojo: el pedido dice {declarados} dias y encontre {n}")
         if fechas:
             futuras = [f for f in fechas if f > ayer]
             if futuras:
@@ -417,6 +422,7 @@ def interpretar_local(texto, conocidas=(), hoy=None):
             "nota": "; ".join(notas),
             "forzar_unload": bool(re.search(r"\bforz", tr["seg"])),
             "solo_mover": bool(re.search(r"\bsolo[\s_-]*mov|\bsin (?:correr el )?unload\b", tr["seg"])),
+            "solo_faltantes": faltantes,
         })
     if errores:
         raise PedidoInvalido("; ".join(errores))
@@ -437,7 +443,8 @@ Pedido:
 
 Formato exacto:
 {{"items": [{{"tabla": "...", "desde": "AAAA-MM-DD", "hasta": "AAAA-MM-DD",
-             "fechas": null, "forzar_unload": false, "solo_mover": false}}],
+             "fechas": null, "solo_faltantes": false,
+             "forzar_unload": false, "solo_mover": false}}],
   "dudas": []}}
 
 Reglas:
@@ -451,6 +458,13 @@ Reglas:
   "5, 17 y 28 de enero", "2025-05-01 → 2025-05-03, 2025-07-11"): en "fechas"
   la lista COMPLETA de dias AAAA-MM-DD (cada sub-rango expandido dia por dia),
   y desde/hasta = el primero y el ultimo. No lo conviertas en un rango.
+- "solo_faltantes": true si pide los dias que FALTAN / los huecos / los dias
+  sin archivos. Si describe un tramo con huecos sin listar los dias exactos
+  ("irregular entre X e Y", "faltan varios dias de marzo"), NO lo descartes:
+  incluí el tramo completo y "solo_faltantes": true; flow revisa en destino
+  que dias faltan y baja solo esos.
+- Ignora las fechas que son contexto y no dias a cargar (ej. "el ultimo run
+  exitoso fue hoy 2026-09-28").
 - Fechas inclusivas. Un mes: del 1 al ultimo dia. Un año: 1-ene a 31-dic.
   "Fin de año": 31-dic del año en contexto.
 - Si no dice el año, usa el del contexto del pedido. Si no hay ninguno, el año
@@ -550,6 +564,7 @@ def interpretar_claude(texto, conocidas, hoy=None, timeout=180):
             continue
         items.append({"tabla": tabla, "desde": desde, "hasta": hasta, "fechas": fechas,
                       "nota": "; ".join(nota),
+                      "solo_faltantes": it.get("solo_faltantes") is True,
                       "forzar_unload": it.get("forzar_unload") is True,
                       "solo_mover": it.get("solo_mover") is True})
     if not items:

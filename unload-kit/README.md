@@ -1,4 +1,4 @@
-# unload kit v9.5.1  (flow 2.5.1 · unload 5.2 · generador con dias sueltos)
+# unload kit v9.6  (flow 2.6 · unload 5.2 · generador con dias sueltos)
 
 Backfill desde Redshift (cuenta 595738433757) hacia tablas raw existentes
 (cuenta 608614369971). El esquema lo dicta la TABLA DESTINO.
@@ -31,7 +31,11 @@ antes y los DAGs FCSM normales no cambian. Commitealo en el repo junto a los
 JSON sincronizados, o el proximo deploy de CI/CD lo pisa.
 
 Con el generador viejo desplegado, flow NO publica JSON sincronizados (lo
-revisa antes de subir), y si igual algo se colara, revierte la publicacion.
+revisa antes de subir). Despues de subir espera a que el DAG aparezca con el
+tag SCHEMA-STRICT: MWAA copia los archivos de S3 cada ~30-60 s, asi que los
+primeros parseos pueden traer todavia el JSON viejo (FLOW_ESPERA_MIN, 6 por
+defecto). Si vence la espera y el generador en S3 es el correcto, el JSON
+queda publicado y alcanza con volver a correr.
 
 ## Varias tablas, en texto libre
 
@@ -88,6 +92,17 @@ Si un UNLOAD escribe dias que no se pidieron, avisa y no los mueve.
 
 Tambien aplica a los rangos: si al rango le faltan dias salteados en el
 landing, se bajan todos en un solo UNLOAD con la lista exacta.
+
+## Solo los dias que faltan en destino
+
+    flow 7 --desde 2025-01-01 --hasta 2025-04-09 --faltantes
+    flow "ingesta los dias que faltan de fact_obsolescence entre 2025-01-01 y 2025-04-09"
+
+Revisa que dias del rango (o de la lista) no tienen particion en destino y
+baja solo esos, en un solo UNLOAD. Los que ya tienen datos no se tocan. En
+un pedido en texto se activa con "faltan", "huecos", "sin archivos"; si el
+pedido describe un tramo irregular sin listar los dias, Claude Code lo
+incluye con este modo en vez de descartarlo.
 
 ## Tablas sin JSON
 

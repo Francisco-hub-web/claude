@@ -45,6 +45,9 @@ Uso:
     flow 7 --particion 2025-01-05,2025-05-01..2025-05-03
                                               solo esos dias (pipeline completo: UNLOAD
                                               filtrado con load_dates, mover y verificar)
+    flow 7 --desde 2025-01-01 --hasta 2025-04-09 --faltantes
+                                              solo los dias del rango (o de --particion)
+                                              que no tienen datos en destino
     flow 7 ... --no-sync                      no toca el JSON (solo valida)
     flow 7 ... --forzar-unload                baja todo el rango de Redshift aunque
                                               ya este en el landing
@@ -58,7 +61,7 @@ Requiere unload.py en el mismo directorio, boto3 + requests (como mwaa_cert)
 y psycopg2 solo si genera o valida contra Redshift (FLOW_RS_PASS).
 """
 
-__version__ = "2.5.1"
+__version__ = "2.6"
 
 import json
 import os
@@ -312,37 +315,46 @@ def show_failed_tasks(s, host, dag_id, run_id):
     U.info(f"Detalle:  mwaa_cert log {dag_id}")
 
 
-def esperar_dag(s, host, dag_id, desde_utc, exigir_strict, minutos=6):
-    """Espera a que MWAA re-parsee el DAG despues de publicar el JSON.
+ESPERA_MIN = float(os.environ.get("FLOW_ESPERA_MIN", "6"))
 
-    Senal de "ya tomo el JSON nuevo": last_parsed_time posterior a la subida.
-    Si el JSON es estricto, ademas exige el tag SCHEMA-STRICT: si falta, el
-    generador desplegado es el viejo y un JSON sincronizado le rompe el UNLOAD.
+
+def esperar_dag(s, host, dag_id, desde_utc, exigir_strict, minutos=None):
+    """Espera a que MWAA tome el JSON recien publicado: True | False | "sin_tag".
+
+    Senal: last_parsed_time posterior a la subida (desde_utc=None: cualquier
+    parseo) y, si el JSON es estricto, el tag SCHEMA-STRICT. last_parsed_time
+    solo no alcanza: MWAA copia los archivos de S3 a sus contenedores cada
+    ~30-60 s, asi que un parseo que termina despues de la subida puede haber
+    leido todavia el JSON viejo, sin el tag. Parseado sin tag = seguir esperando;
+    recien al vencer la espera se devuelve "sin_tag" para que publicar decida.
     """
-    print(f"  Esperando que MWAA tome el JSON (hasta {minutos} min)", end="", flush=True)
+    minutos = ESPERA_MIN if minutos is None else minutos
+    print(f"  Esperando que MWAA tome el JSON (hasta {minutos:g} min)", end="", flush=True)
     inicio = time.time()
     limite = inicio + minutos * 60
+    sin_tag = False
     while time.time() < limite:
         d = api(s, host, "GET", f"dags/{dag_id}", silencioso=True)
         if d:
             lp = parse_iso(d.get("last_parsed_time"))
-            nuevo = (lp is not None and lp > desde_utc) or \
-                    (lp is None and time.time() - inicio > 90)
+            nuevo = desde_utc is None or (lp is not None and lp > desde_utc) or \
+                (lp is None and time.time() - inicio > 90)
             if nuevo:
-                print()
                 if d.get("has_import_errors"):
+                    print()
                     U.bad("MWAA reporta errores de import en el archivo del DAG.")
                     return False
-                if exigir_strict and STRICT_TAG not in tags_de(d):
-                    U.bad("El DAG no trae el tag SCHEMA-STRICT: en MWAA sigue el "
-                          "generador viejo.")
-                    return "viejo"
-                U.ok("MWAA ya tomo el JSON nuevo.")
-                return True
+                if not exigir_strict or STRICT_TAG in tags_de(d):
+                    print()
+                    U.ok("MWAA ya tomo el JSON nuevo.")
+                    return True
+                sin_tag = True        # parseo con el JSON viejo todavia: esperar
         print(".", end="", flush=True)
         time.sleep(15)
     print()
-    U.bad(f"MWAA no re-parseo el DAG en {minutos} min.")
+    if exigir_strict and sin_tag:
+        return "sin_tag"
+    U.bad(f"MWAA no re-parseo el DAG en {minutos:g} min.")
     U.info("Reintenta en un rato: el JSON ya esta en S3.")
     return False
 
@@ -598,9 +610,12 @@ def publicar(path, s, host, dag_id, exigir_strict):
             U.info("Revisa errores de import del generador en la UI de MWAA.")
             return False
         if exigir_strict and STRICT_TAG not in tags_de(d):
-            U.bad("El DAG no trae el tag SCHEMA-STRICT: en MWAA sigue el generador viejo.")
-            U.info("Desplegalo con:  flow --desplegar-generador")
-            return False
+            # publicado en una corrida anterior, pero MWAA puede no haberlo tomado aun
+            U.info("El DAG todavia no trae el tag SCHEMA-STRICT: espero a que MWAA lo tome.")
+            r = esperar_dag(s, host, dag_id, None, True)
+            if r == "sin_tag":
+                return _dag_sin_tag(path, None)
+            return r is True
         return True
 
     # Antes de subir un JSON estricto: el generador desplegado tiene que entenderlo.
@@ -620,11 +635,24 @@ def publicar(path, s, host, dag_id, exigir_strict):
     if not subir_loader_s3(path):
         return False
     r = esperar_dag(s, host, dag_id, t_up, exigir_strict)
-    if r == "viejo":
-        revertir_publicacion(path, crudo)
-        U.info("Desplega el generador con:  flow --desplegar-generador")
-        return False
+    if r == "sin_tag":
+        return _dag_sin_tag(path, crudo, revertir=True)
     return r is True
+
+
+def _dag_sin_tag(path, crudo, revertir=False):
+    """Vencio la espera y el DAG sigue sin SCHEMA-STRICT: generador viejo o MWAA lento?"""
+    k, txt = buscar_generador_s3()
+    if k and not generador_es_estricto(txt):
+        U.bad("El generador desplegado en MWAA es el viejo: no entiende JSON sincronizados.")
+        if revertir:
+            revertir_publicacion(path, crudo)
+        U.info("Desplegalo con:  flow --desplegar-generador")
+        return False
+    U.bad(f"MWAA todavia no tomo el JSON nuevo ({ESPERA_MIN:g} min esperando).")
+    U.info("El generador en S3 es el correcto y el JSON quedo publicado: MWAA lo va a tomar.")
+    U.info("Volve a correr en unos minutos (en una cola:  flow --cola).")
+    return False
 
 
 # ─── generador desplegado ─────────────────────────────────────────────────────
@@ -1402,6 +1430,17 @@ def run_flow(cfg, o):
         U.info("En el listado, los de backfill aparecen como [only_unload].")
         return False
 
+    # dos JSON con el mismo schema/table generan el mismo dag_id: MWAA se queda
+    # con uno cualquiera, y el que se publica puede no ser el que termina usando
+    propio = Path(cfg.get("_file") or "").resolve()
+    otros = [d for d in U.load_defs() if d["schema"] == schema and d["table"] == table
+             and Path(d["_file"]).resolve() != propio]
+    if otros:
+        print()
+        U.warn(f"Otro JSON genera el mismo DAG ({dag_id}): "
+               + ", ".join(Path(d["_file"]).name for d in otros))
+        U.info("MWAA usa uno solo de los dos: borra (o renombra la tabla de) el que sobra.")
+
     SIN_DATOS = []
     rango = pedidas or (rango_a_parts(o["desde"], o["hasta"]) if o["desde"] and o["hasta"] else None)
     okey = False
@@ -1462,6 +1501,26 @@ def run_flow(cfg, o):
                 U.ok("JSON sincronizado y publicado.")
                 U.info(f"Para cargar:  flow {sel} --desde AAAA-MM-DD --hasta AAAA-MM-DD")
                 return True
+
+        # ── solo los dias que faltan en destino (--faltantes / "los que faltan") ──
+        if o.get("faltantes") and rango:
+            col = cfg.get("column_dt", "calendar_dt")
+            p_dst = U.PREFIX_DST_TPL.format(schema=schema, table=table)
+            print()
+            try:
+                hay = {p.split("=", 1)[1] for p in U.list_prefixes(
+                    U.BUCKET_DST, p_dst, U.PROFILE_DST, "particiones destino", strict=True)
+                    if p.startswith(col + "=")}
+            except RuntimeError as e:
+                U.bad(str(e))
+                return False
+            faltan_dst = [f for f in rango if f not in hay]
+            print(f"  Dias que faltan en destino: {len(faltan_dst)} de {len(rango)} pedidos"
+                  + (f"  ({U.rangos(faltan_dst, 4)})" if faltan_dst else ""))
+            if not faltan_dst:
+                U.ok("Todos los dias pedidos ya tienen datos en destino: no hay nada que ingestar.")
+                return True
+            rango = pedidas = faltan_dst
 
         def a_bajar(fechas):
             """Corridas de UNLOAD para esas fechas (una sola si el DAG acepta load_dates)."""
@@ -1777,6 +1836,9 @@ def mostrar_plan(items):
             U.info("forzar unload: baja todo de Redshift aunque este en el landing")
         if it.get("solo_mover"):
             U.info("solo mover lo que ya esta en el landing (sin UNLOAD)")
+        if it.get("solo_faltantes"):
+            U.info("solo los dias que falten en destino (se revisa al correr; "
+                   "los que ya tienen datos no se tocan)")
         if it.get("nota"):
             U.info(it["nota"])
 
@@ -1861,7 +1923,8 @@ def cmd_cola(texto):
                          "fechas": it.get("fechas") or None,
                          "nota": it.get("nota", ""), "estado": "pendiente",
                          "forzar_unload": bool(it.get("forzar_unload")),
-                         "solo_mover": bool(it.get("solo_mover"))})
+                         "solo_mover": bool(it.get("solo_mover")),
+                         "solo_faltantes": bool(it.get("solo_faltantes"))})
         if errores:
             print()
             for e in errores:
@@ -1928,7 +1991,8 @@ def _correr_item(it):
         o = {"desde": it["desde"], "hasta": it["hasta"], "run_id": None,
              "solo_dag": False, "solo_mover": bool(it.get("solo_mover")),
              "solo_sync": False, "solo_json": False, "no_sync": False, "prep": prep,
-             "forzar_unload": bool(it.get("forzar_unload")), "fechas": it.get("fechas")}
+             "forzar_unload": bool(it.get("forzar_unload")), "fechas": it.get("fechas"),
+             "faltantes": bool(it.get("solo_faltantes"))}
         U.SOLO_PARTS, U.SOLO_PARTS_RANGO = None, False
         del U.ERRORES[:]
         try:
@@ -2060,6 +2124,7 @@ def main():
         "solo_sync": "--solo-sync" in flags, "solo_json": "--solo-json" in flags,
         "no_sync": "--no-sync" in flags, "prep": None,
         "forzar_unload": "--forzar-unload" in flags, "fechas": None,
+        "faltantes": "--faltantes" in flags,
     }
     U.AUTO = bool(flags & {"--auto", "--auto-borrar"})
     U.AUTO_BORRAR = "--auto-borrar" in flags

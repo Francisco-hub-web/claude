@@ -794,12 +794,11 @@ def _como_recuperar(cfg, fechas):
         info(f"  flow {table} --solo-mover --particiones-archivo {f}")
     if resto:
         info("")
-        info(f"{len(resto)} ya no estan en el landing: hay que volver a bajarlas de Redshift:")
-        bs = bloques(resto)
-        for a, b, _ in bs[:5]:
-            info(f"  flow {table} --desde {a} --hasta {b}")
-        if len(bs) > 5:
-            info(f"  ... y {len(bs) - 5} tramos mas")
+        info(f"{len(resto)} ya no estan en el landing: se vuelven a bajar de Redshift, todas")
+        info("en un solo UNLOAD:")
+        lista = ",".join(a if n == 1 else f"{a}..{b}" for a, b, n in bloques(resto))
+        info(f"  flow {table} --particion {lista}")
+        info("(si Redshift no tiene datos de algun dia, flow lo informa: ese dia esta vacio de verdad)")
 
 
 def cmd_fix_location(cfg):
@@ -900,6 +899,12 @@ AWS_RC = {
     254: "S3 devolvio un error",
     255: "error general de la CLI",
 }
+# Codigo negativo = el proceso de aws murio por una senal (no es un error de S3)
+AWS_SENAL = {
+    11: "la CLI de aws se cayo (segmentation fault); suele ser puntual y el reintento lo resuelve",
+    9: "el sistema mato el proceso (SIGKILL; falta de memoria?)",
+    15: "proceso terminado (SIGTERM)",
+}
 
 
 def dur(seg):
@@ -938,9 +943,12 @@ def sync_s3(src, dst, profile, que, extra=()):
     for intento in range(1, REINTENTOS + 1):
         r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if r.returncode == 0:
+            if intento > 1:
+                print(f"    {C.OK}✓{C.END} reintento OK", end="  ", flush=True)
             return True
         rc = r.returncode
-        motivo = f"terminado por la senal {-rc}" if rc < 0 else AWS_RC.get(rc, "error")
+        motivo = (AWS_SENAL.get(-rc, f"terminado por la senal {-rc}") if rc < 0
+                  else AWS_RC.get(rc, "error"))
         print()
         bad(f"Fallo la {que}: aws s3 sync salio con codigo {rc} ({motivo}).")
         lineas = [l for l in (r.stderr + "\n" + r.stdout).splitlines() if l.strip()]
